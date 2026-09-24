@@ -1,0 +1,8 @@
+This distribution contains a patch for Hermes Agent from Nous Research.
+
+Upstream project: https://github.com/NousResearch/hermes-agent
+Upstream baseline: 9b419a2d3c2657c192008e732149d61170b32c01
+Upstream license: MIT License, Copyright (c) 2025 Nous Research.
+
+The Codex task plugin and packaging documentation are provided as an integration
+layer for the pinned upstream revision and remain subject to the MIT license.

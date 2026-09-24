@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.log
+*.jsonl
+__pycache__/
+.venv/
+runtime/
+sessions/
+work/

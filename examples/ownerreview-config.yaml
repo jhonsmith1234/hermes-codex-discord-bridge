@@ -1,0 +1,18 @@
+# Merge this example into the target Hermes profile's config.yaml.
+# Replace placeholders locally; do not commit the populated file.
+plugins:
+  enabled:
+    - codex_tasks
+  entries:
+    codex_tasks:
+      allow_gateway_injection: true
+      settings:
+        profile: ownerreview
+        owner_conversation_id: "DISCORD_OWNER_DM_ID"
+        cwd: "/path/to/codex/workspace"
+        state_path: "gateway/codex_app_tasks.sqlite"
+        codex_bin: "codex"
+        # Optional. Omit to inherit the Codex CLI's normal home.
+        # codex_home: "/path/to/codex-home"
+        turn_timeout: 600
+        max_workers: 1

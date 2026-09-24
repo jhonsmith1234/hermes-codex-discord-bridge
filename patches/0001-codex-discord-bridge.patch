@@ -1,0 +1,3721 @@
+diff --git a/agent/transports/codex_app_server.py b/agent/transports/codex_app_server.py
+index 54d5ec4..5db0d5e 100644
+--- a/agent/transports/codex_app_server.py
++++ b/agent/transports/codex_app_server.py
+@@ -103,0 +104 @@ class CodexAppServerClient:
++        self._send_lock = threading.Lock()
+@@ -218,2 +219,6 @@ class CodexAppServerClient:
+-            self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+-            self._proc.stdin.flush()
++            # A gateway answer can arrive on a different thread while the turn
++            # driver is issuing an interrupt or another protocol request.  A
++            # single JSONL write must not be interleaved on stdin.
++            with self._send_lock:
++                self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
++                self._proc.stdin.flush()
+diff --git a/agent/transports/codex_app_server_session.py b/agent/transports/codex_app_server_session.py
+index effc28e..f3b2bf0 100644
+--- a/agent/transports/codex_app_server_session.py
++++ b/agent/transports/codex_app_server_session.py
+@@ -12,0 +13 @@ import contextlib
++import copy
+@@ -18 +19 @@ from dataclasses import dataclass, field
+-from typing import Any, Callable, Optional
++from typing import Any, Callable, Mapping, Optional
+@@ -55,0 +57,35 @@ class TurnResult:
++    # A background caller may have no live user-input route.  Keep this
++    # separate from a transport error so the durable task can remain waiting
++    # instead of being reported as a false success.
++    waiting_for_user: bool = False
++    server_request_kind: Optional[str] = None
++    server_request_summary: Optional[str] = None
++
++
++@dataclass(frozen=True, slots=True)
++class PendingServerRequest:
++    """A live app-server request which is waiting for an explicit human answer.
++
++    ``params`` is retained only in the live session.  Durable task state stores
++    the method, request id, redacted summary, and expiry, so a gateway restart
++    cannot accidentally replay a stale or sensitive request payload.
++    """
++
++    request_id: str
++    method: str
++    params: dict[str, Any]
++    summary: str
++    created_at: float
++    expires_at: float | None
++    thread_id: str | None = None
++    turn_id: str | None = None
++    wire_request_id: Any = None
++
++
++@dataclass(frozen=True, slots=True)
++class ServerRequestAnswerResult:
++    """Result of attempting to answer one exact pending server request."""
++
++    accepted: bool
++    reason: str
++    message: str
+@@ -147,0 +184,7 @@ class _ServerRequestRouting:
++@dataclass
++class _PendingServerRequestState:
++    request: PendingServerRequest
++    answer: dict[str, Any] | None = None
++    answer_reason: str | None = None
++
++
+@@ -157,0 +201 @@ class CodexAppServerSession:
++        client_capabilities: Optional[dict[str, Any]] = None,
+@@ -168,0 +213 @@ class CodexAppServerSession:
++        self._client_capabilities = dict(client_capabilities or {})
+@@ -177,0 +223,3 @@ class CodexAppServerSession:
++        self._pending_condition = threading.Condition()
++        self._pending_server_request: _PendingServerRequestState | None = None
++        self._deferred_notifications: list[dict] = []
+@@ -186 +234,4 @@ class CodexAppServerSession:
+-        self._client.initialize(client_name="hermes", client_title="Hermes Agent", client_version=_get_hermes_version())
++        self._client.initialize(
++            client_name="hermes", client_title="Hermes Agent", client_version=_get_hermes_version(),
++            capabilities=self._client_capabilities,
++        )
+@@ -204,0 +256,2 @@ class CodexAppServerSession:
++        with self._pending_condition:
++            self._pending_condition.notify_all()
+@@ -215,0 +269,58 @@ class CodexAppServerSession:
++        with self._pending_condition:
++            self._pending_condition.notify_all()
++
++    def pending_server_request(self) -> PendingServerRequest | None:
++        """Return a copy of the live pending request, if one exists."""
++        with self._pending_condition:
++            pending = self._pending_server_request
++            if pending is None:
++                return None
++            return pending.request
++
++    def answer_server_request(
++        self, request_id: str, response: Mapping[str, Any], *,
++        before_release: Callable[[], None] | None = None,
++    ) -> ServerRequestAnswerResult:
++        """Stage a validated human answer for one exact live server request.
++
++        ``before_release`` runs while the pending slot is still reserved.  The
++        durable bridge uses it to move the task out of ``waiting_for_user``
++        before this method wakes the app-server turn, which closes the race
++        where a very fast Codex response could settle the task first.
++        """
++        if not isinstance(response, Mapping):
++            return ServerRequestAnswerResult(False, "invalid", "The answer must be a JSON object")
++        with self._pending_condition:
++            pending = self._pending_server_request
++            if pending is None:
++                return ServerRequestAnswerResult(False, "no_pending", "No live Codex server request is pending")
++            if str(request_id) != pending.request.request_id:
++                return ServerRequestAnswerResult(False, "mismatch", "The Codex server request id does not match the live request")
++            if pending.answer is not None:
++                return ServerRequestAnswerResult(False, "duplicate", "This Codex server request was already answered")
++            if pending.request.expires_at is not None and time.monotonic() >= pending.request.expires_at:
++                response_dict = _timeout_response_for_request(pending.request)
++                pending.answer = response_dict
++                pending.answer_reason = "auto_timeout"
++                self._pending_condition.notify_all()
++                if before_release is not None:
++                    try:
++                        before_release()
++                    except Exception:
++                        pending.answer = None
++                        pending.answer_reason = None
++                        raise
++                return ServerRequestAnswerResult(False, "expired", "The Codex server request has expired")
++            response_dict, error = _validate_server_request_response(pending.request, response)
++            if error is not None:
++                return ServerRequestAnswerResult(False, "invalid", error)
++            if before_release is not None:
++                try:
++                    before_release()
++                except Exception as exc:
++                    logger.exception("failed to release durable task before Codex answer")
++                    return ServerRequestAnswerResult(False, "store_error", str(exc))
++            pending.answer = response_dict
++            pending.answer_reason = "owner"
++            self._pending_condition.notify_all()
++            return ServerRequestAnswerResult(True, "accepted", "Codex answer accepted; the same turn is resuming")
+@@ -328,0 +440,4 @@ class CodexAppServerSession:
++        on_turn_started: Optional[Callable[[str], None]] = None,
++        on_server_request: Optional[Callable[[PendingServerRequest], None]] = None,
++        on_server_request_settled: Optional[Callable[[PendingServerRequest, str], None]] = None,
++        allow_pending_server_requests: bool = False,
+@@ -353 +468,5 @@ class CodexAppServerSession:
+-                    self._run_started_turn(result, ts, turn_timeout, notification_poll_timeout, post_tool_quiet_timeout)
++                    self._run_started_turn(
++                        result, ts, turn_timeout, notification_poll_timeout,
++                        post_tool_quiet_timeout, on_turn_started, on_server_request,
++                        on_server_request_settled, allow_pending_server_requests,
++                    )
+@@ -359 +478,4 @@ class CodexAppServerSession:
+-        post_tool_quiet_timeout: float,
++        post_tool_quiet_timeout: float, on_turn_started: Optional[Callable[[str], None]] = None,
++        on_server_request: Optional[Callable[[PendingServerRequest], None]] = None,
++        on_server_request_settled: Optional[Callable[[PendingServerRequest, str], None]] = None,
++        allow_pending_server_requests: bool = False,
+@@ -363,0 +486,5 @@ class CodexAppServerSession:
++        if result.turn_id is not None and on_turn_started is not None:
++            try:
++                on_turn_started(result.turn_id)
++            except Exception:  # Persistence callback must not stop the Codex turn.
++                logger.exception("on_turn_started callback raised")
+@@ -365,0 +493,2 @@ class CodexAppServerSession:
++        turn_deadline = time.monotonic() + turn_timeout
++        server_request_callback = on_server_request
+@@ -393 +522,64 @@ class CodexAppServerSession:
+-            self._handle_server_request(sreq)
++            request_status = self._handle_server_request(
++                sreq, allow_pending=allow_pending_server_requests,
++            )
++            if isinstance(request_status, PendingServerRequest):
++                if server_request_callback is not None:
++                    try:
++                        server_request_callback(request_status)
++                    except Exception:
++                        # A notification failure must not silently turn into an
++                        # approval.  The pending request remains live and will
++                        # fail closed on timeout unless the route is repaired.
++                        logger.exception("on_server_request callback raised")
++                pending_status = self._wait_for_pending_server_request(
++                    request_status, deadline=turn_deadline, notification_poll_timeout=notification_poll_timeout,
++                    on_note=on_note, on_server_request_settled=on_server_request_settled,
++                )
++                if pending_status == "disconnected":
++                    result.error = (
++                        f"Codex pending server request {request_status.request_id} was lost because "
++                        "the app-server disconnected"
++                    )
++                    result.should_retire = True
++                    return True
++                if pending_status == "interrupted":
++                    result.interrupted = True
++                    result.error = result.error or (
++                        f"Codex pending server request {request_status.request_id} was cleared by interruption"
++                    )
++                    return True
++                if pending_status == "cleared":
++                    result.error = result.error or (
++                        f"Codex cleared pending server request {request_status.request_id} before the owner answered"
++                    )
++                if pending_status == "timeout":
++                    # A timed-out human request must never fall through to the
++                    # "final assistant text at deadline" success path. The
++                    # live session is being retired, so durable callers must
++                    # surface uncertainty instead of claiming success without
++                    # the requested action.
++                    result.error = (
++                        f"Codex pending server request {request_status.request_id} "
++                        "timed out before the owner answered"
++                    )
++                    result.should_retire = True
++                    return True
++                # An owner answer or a fail-closed timeout is a live response;
++                # continue driving this same turn instead of starting another.
++                last_tool_completion_at = None
++                return False
++            if request_status is not None:
++                kind, summary = request_status
++                result.server_request_kind = kind
++                result.server_request_summary = summary
++                if kind == "waiting_for_user":
++                    result.waiting_for_user = True
++                # Also expose the reason through the normal turn result so a
++                # caller that does not understand ``waiting_for_user`` cannot
++                # report an empty/partial turn as success.
++                result.error = result.error or summary
++                # There is no safe way for this background session to keep an
++                # interactive request pending after this turn returns.  Stop
++                # the turn and let the durable task report the exact gap.
++                self._issue_interrupt(result.turn_id)
++                return True
+@@ -417,0 +610 @@ class CodexAppServerSession:
++            deadline=turn_deadline,
+@@ -427,0 +621 @@ class CodexAppServerSession:
++        deadline: float | None = None,
+@@ -437 +631 @@ class CodexAppServerSession:
+-        deadline = time.monotonic() + turn_timeout
++        deadline = time.monotonic() + turn_timeout if deadline is None else deadline
+@@ -452 +646 @@ class CodexAppServerSession:
+-            note = self._client.take_notification(timeout=notification_poll_timeout)
++            note = self._take_notification(timeout=notification_poll_timeout)
+@@ -551 +745,11 @@ class CodexAppServerSession:
+-    def _handle_server_request(self, req: dict) -> None:
++    def _take_notification(self, timeout: float = 0.0) -> dict | None:
++        """Take a deferred notification first, then read from the wire."""
++        if self._deferred_notifications:
++            return self._deferred_notifications.pop(0)
++        if self._client is None:
++            return None
++        return self._client.take_notification(timeout=timeout)
++
++    def _handle_server_request(
++        self, req: dict, *, allow_pending: bool = False,
++    ) -> PendingServerRequest | tuple[str, str] | None:
+@@ -558 +762 @@ class CodexAppServerSession:
+-            return
++            return ("error", "Codex server request received without an active client")
+@@ -561,0 +766,16 @@ class CodexAppServerSession:
++        if allow_pending and method in {
++            "item/commandExecution/requestApproval", "item/fileChange/requestApproval",
++            "item/permissions/requestApproval", "tool/requestUserInput", "item/tool/requestUserInput",
++            "mcpServer/elicitation/request",
++        }:
++            return self._register_pending_server_request(req)
++        if method in {"tool/requestUserInput", "item/tool/requestUserInput"}:
++            logger.warning("Codex requested user input, but no owner-DM input route is wired: %s", method)
++            self._client.respond_error(
++                rid, code=-32000,
++                message="Hermes owner-DM bridge has no structured user-input route for this Codex request",
++            )
++            return (
++                "waiting_for_user",
++                "Codex requested structured user input, but the owner-DM answer route is not wired yet",
++            )
+@@ -566 +786,2 @@ class CodexAppServerSession:
+-            return
++            return ("error", f"Codex sent unsupported server request: {method}")
++        waiting_summary = self._waiting_summary_for_request(method, params)
+@@ -567,0 +789,168 @@ class CodexAppServerSession:
++        return waiting_summary
++
++    def _register_pending_server_request(self, req: dict) -> PendingServerRequest | tuple[str, str]:
++        """Capture a supported request without answering or interrupting it."""
++        if self._client is None:
++            return ("error", "Codex server request received without an active client")
++        wire_id = req.get("id")
++        if wire_id is None:
++            self._client.respond_error(
++                wire_id, code=-32600, message="Interactive Codex server requests require a request id",
++            )
++            return ("error", "Codex interactive server request had no request id")
++        method = str(req.get("method") or "")
++        params = req.get("params") if isinstance(req.get("params"), Mapping) else {}
++        params = copy.deepcopy(dict(params))
++        now = time.monotonic()
++        auto_resolution_ms = params.get("autoResolutionMs")
++        expires_at = None
++        if isinstance(auto_resolution_ms, int) and not isinstance(auto_resolution_ms, bool) and auto_resolution_ms >= 0:
++            expires_at = now + (auto_resolution_ms / 1000.0)
++        pending = PendingServerRequest(
++            request_id=str(wire_id), method=method, params=params,
++            summary=_describe_server_request(method, params), created_at=now,
++            expires_at=expires_at,
++            thread_id=str(params.get("threadId") or self._thread_id or "") or None,
++            turn_id=str(params.get("turnId") or self._active_turn_id or "") or None,
++            wire_request_id=wire_id,
++        )
++        with self._pending_condition:
++            if self._pending_server_request is not None:
++                self._client.respond_error(
++                    wire_id, code=-32000,
++                    message="Hermes already has one live Codex server request for this turn",
++                )
++                return ("error", "Codex sent a second interactive server request while another was pending")
++            self._pending_server_request = _PendingServerRequestState(request=pending)
++            self._pending_condition.notify_all()
++        logger.info(
++            "Codex app-server request is pending human response: method=%s request_id=%s thread=%s turn=%s",
++            method, pending.request_id, pending.thread_id, pending.turn_id,
++        )
++        return pending
++
++    def _wait_for_pending_server_request(
++        self, pending: PendingServerRequest, *, deadline: float,
++        notification_poll_timeout: float,
++        on_note: Callable[[dict, str], bool],
++        on_server_request_settled: Optional[Callable[[PendingServerRequest, str], None]],
++    ) -> str:
++        """Wait for an answer while continuing to observe the app-server wire.
++
++        A plain ``Event.wait()`` is insufficient here: app-server can emit
++        ``serverRequest/resolved`` or clear the request when the turn ends.
++        Notifications unrelated to the pending request are deferred back to
++        the normal turn projector so they cannot be lost while Discord is idle.
++        """
++        state: _PendingServerRequestState | None
++        with self._pending_condition:
++            state = self._pending_server_request
++        if state is None or state.request.request_id != pending.request_id:
++            return "cleared"
++
++        def settle_without_response(reason: str) -> None:
++            with self._pending_condition:
++                if self._pending_server_request is not state:
++                    return
++                self._pending_server_request = None
++                self._pending_condition.notify_all()
++            if on_server_request_settled is not None:
++                try:
++                    on_server_request_settled(pending, reason)
++                except Exception:
++                    logger.exception("on_server_request_settled callback raised")
++
++        def stage_internal_response(response: dict, reason: str) -> None:
++            with self._pending_condition:
++                if self._pending_server_request is not state or state.answer is not None:
++                    return
++                state.answer = response
++                state.answer_reason = reason
++                self._pending_condition.notify_all()
++            if on_server_request_settled is not None:
++                try:
++                    on_server_request_settled(pending, reason)
++                except Exception:
++                    logger.exception("on_server_request_settled callback raised")
++
++        while True:
++            with self._pending_condition:
++                if self._pending_server_request is not state:
++                    return "cleared"
++                if state.answer is not None:
++                    response = dict(state.answer)
++                    answer_reason = state.answer_reason or "owner"
++                else:
++                    response = None
++                    answer_reason = None
++                interrupted = self._interrupt_event.is_set()
++                closed = self._closed
++                dead = self._client is None or not self._client.is_alive()
++                remaining = deadline - time.monotonic()
++                if pending.expires_at is not None:
++                    remaining = min(remaining, pending.expires_at - time.monotonic())
++
++            if response is not None:
++                try:
++                    self._client.respond(pending.wire_request_id, response)
++                except (BrokenPipeError, ConnectionError, OSError, RuntimeError) as exc:
++                    settle_without_response("disconnected")
++                    logger.warning("Could not send Codex server request response: %s", exc)
++                    return "disconnected"
++                with self._pending_condition:
++                    if self._pending_server_request is state:
++                        self._pending_server_request = None
++                        self._pending_condition.notify_all()
++                if answer_reason == "auto_timeout":
++                    # A Codex-side auto-resolution deadline is a fail-closed
++                    # response, not necessarily a failed Hermes turn. Keep
++                    # driving the same turn so the server can emit its normal
++                    # turn/completed notification. The outer turn deadline is
++                    # still handled separately below.
++                    return "answered"
++                if answer_reason == "timeout":
++                    return "timeout"
++                return "answered" if answer_reason == "owner" else "cleared"
++
++            if closed or dead:
++                settle_without_response("disconnected")
++                return "disconnected"
++            if interrupted:
++                settle_without_response("interrupted")
++                return "interrupted"
++            if remaining <= 0:
++                # Codex may publish an auto-resolution deadline shorter than
++                # Hermes' overall turn deadline. Send the type-specific
++                # fail-closed response and continue the same turn; only the
++                # outer deadline should retire the session.
++                pending_expired = pending.expires_at is not None and pending.expires_at <= time.monotonic()
++                stage_internal_response(
++                    _timeout_response_for_request(pending),
++                    "auto_timeout" if pending_expired else "timeout",
++                )
++                continue
++
++            # Drain notifications in short slices.  The server request itself
++            # is still outstanding, but the stream can report its cleanup or a
++            # turn completion before the client-side timeout fires.
++            note = self._client.take_notification(timeout=min(max(notification_poll_timeout, 0.01), remaining, 0.05))
++            if note is not None:
++                method = str(note.get("method") or "")
++                params = note.get("params") if isinstance(note.get("params"), Mapping) else {}
++                resolved_id = params.get("requestId") or params.get("request_id")
++                if method == "serverRequest/resolved" and resolved_id is not None and str(resolved_id) == pending.request_id:
++                    settle_without_response("cleared")
++                    return "cleared"
++                if method == "turn/completed":
++                    self._deferred_notifications.append(note)
++                    settle_without_response("cleared")
++                    return "cleared"
++                # Keep the same bounded behavior as the normal drive loop.
++                if len(self._deferred_notifications) < 128:
++                    self._deferred_notifications.append(note)
++                else:
++                    logger.warning("dropping deferred Codex notification while waiting for %s", pending.request_id)
++                continue
++
++            with self._pending_condition:
++                self._pending_condition.wait(timeout=min(max(remaining, 0.01), 0.05))
+@@ -570,4 +959,24 @@ class CodexAppServerSession:
+-        """MCP elicitation: auto-accept our own hermes-tools server (opted in by enabling the runtime;
+-        exposes nothing codex's shell can't do); decline others so the user opts in via codex's own flow."""
+-        action = "accept" if (params.get("serverName") or "") == "hermes-tools" else "decline"
+-        return {"action": action, "content": None, "_meta": None}
++        """Decline MCP elicitation unless a real user-answer route is wired.
++
++        In particular, never synthesize an ``accept`` payload for hermes-tools:
++        the App Server protocol requires structured ``content`` for accept.
++        """
++        return {"action": "decline", "content": None, "_meta": None}
++
++    def _waiting_summary_for_request(self, method: str, params: dict) -> tuple[str, str] | None:
++        """Return a durable waiting marker only when a human route is absent."""
++
++        if method == "item/commandExecution/requestApproval":
++            if self._routing.auto_approve_exec or self._approval_callback is not None:
++                return None
++            return ("waiting_for_user", "Codex requested command approval, but no interactive approval route is wired")
++        if method == "item/fileChange/requestApproval":
++            if self._routing.auto_approve_apply_patch or self._approval_callback is not None:
++                return None
++            return ("waiting_for_user", "Codex requested file-change approval, but no interactive approval route is wired")
++        if method == "item/permissions/requestApproval":
++            return ("waiting_for_user", "Codex requested a permission escalation; the owner-DM bridge declines it without confirmation")
++        if method == "mcpServer/elicitation/request":
++            server = str(params.get("serverName") or "unknown MCP server")
++            return ("waiting_for_user", f"MCP elicitation from {server} was declined because no user-answer route is wired")
++        return None
+@@ -636,0 +1046,182 @@ class CodexAppServerSession:
++def _describe_server_request(method: str, params: Mapping[str, Any]) -> str:
++    """Build a short, redacted owner-facing description of a pending request."""
++    def clean(value: Any, limit: int = 600) -> str:
++        text = redact_sensitive_text(str(value or ""), force=True).strip()
++        return text[:limit] + ("…" if len(text) > limit else "")
++
++    if method == "item/commandExecution/requestApproval":
++        command = clean(params.get("command"), 400) or "(command details were not supplied)"
++        if params.get("networkApprovalContext"):
++            network = params.get("networkApprovalContext")
++            return f"Codex requests managed network access: {clean(network, 300)}"
++        detail = clean(params.get("reason"), 300)
++        return f"Codex requests command approval: {command}" + (f" — {detail}" if detail else "")
++    if method == "item/fileChange/requestApproval":
++        detail = clean(params.get("reason"), 300)
++        grant_root = clean(params.get("grantRoot"), 240)
++        suffix = "; ".join(part for part in (detail, f"grantRoot={grant_root}" if grant_root else "") if part)
++        return "Codex requests file-change approval" + (f": {suffix}" if suffix else "")
++    if method == "item/permissions/requestApproval":
++        reason = clean(params.get("reason"), 300)
++        cwd = clean(params.get("cwd"), 240)
++        return "Codex requests a subset of filesystem/network permissions" + \
++            (f" in {cwd}" if cwd else "") + (f" — {reason}" if reason else "")
++    if method in {"tool/requestUserInput", "item/tool/requestUserInput"}:
++        questions = params.get("questions") if isinstance(params.get("questions"), list) else []
++        labels: list[str] = []
++        for question in questions[:3]:
++            if not isinstance(question, Mapping):
++                continue
++            qid = clean(question.get("id"), 80)
++            text = "(secret question)" if question.get("isSecret") else clean(question.get("question"), 260)
++            labels.append(f"{qid}: {text}" if qid else text)
++        return "Codex requests structured input" + (" — " + " | ".join(labels) if labels else "")
++    if method == "mcpServer/elicitation/request":
++        server = clean(params.get("serverName"), 160) or "unknown MCP server"
++        mode = clean(params.get("mode"), 80) or "unknown mode"
++        message = clean(params.get("message"), 400)
++        url = clean(params.get("url"), 500)
++        suffix = "; ".join(part for part in (message, url) if part)
++        return f"MCP elicitation from {server} ({mode})" + (f": {suffix}" if suffix else "")
++    return f"Codex requested unsupported interaction: {clean(method, 160)}"
++
++
++def _timeout_response_for_request(request: PendingServerRequest) -> dict[str, Any]:
++    if request.method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
++        return {"decision": "decline"}
++    if request.method == "item/permissions/requestApproval":
++        return {"permissions": {}}
++    if request.method in {"tool/requestUserInput", "item/tool/requestUserInput"}:
++        return {"answers": {}}
++    if request.method == "mcpServer/elicitation/request":
++        return {"action": "cancel", "content": None, "_meta": None}
++    return {}
++
++
++def _validate_server_request_response(
++    request: PendingServerRequest, raw_response: Mapping[str, Any],
++) -> tuple[dict[str, Any] | None, str | None]:
++    """Validate a human response against the exact app-server request family."""
++    response = copy.deepcopy(dict(raw_response))
++    method = request.method
++    if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
++        if set(response) != {"decision"} or response.get("decision") not in {"accept", "acceptForSession", "decline", "cancel"}:
++            return None, "Approval responses must contain only decision=accept, acceptForSession, decline, or cancel"
++        return response, None
++    if method == "item/permissions/requestApproval":
++        allowed = {"permissions", "scope", "strictAutoReview"}
++        if set(response) - allowed or not isinstance(response.get("permissions"), Mapping):
++            return None, "Permission responses require a permissions object and optional scope"
++        scope = response.get("scope", "turn")
++        if scope not in {"turn", "session"}:
++            return None, "Permission scope must be 'turn' or 'session'"
++        if "strictAutoReview" in response and response["strictAutoReview"] is not None \
++                and not isinstance(response["strictAutoReview"], bool):
++            return None, "strictAutoReview must be boolean or null"
++        requested = request.params.get("permissions")
++        if not isinstance(requested, Mapping):
++            requested = {}
++        if not _permission_subset(response["permissions"], requested):
++            return None, "The granted permissions must be a subset of the permissions Codex requested"
++        return response, None
++    if method in {"tool/requestUserInput", "item/tool/requestUserInput"}:
++        if set(response) != {"answers"} or not isinstance(response.get("answers"), Mapping):
++            return None, "Structured input responses require an answers object"
++        questions = request.params.get("questions") if isinstance(request.params.get("questions"), list) else []
++        question_ids = {str(q.get("id")) for q in questions if isinstance(q, Mapping) and q.get("id")}
++        answers = response["answers"]
++        if question_ids and set(str(key) for key in answers) != question_ids:
++            return None, "Answers must contain exactly the requested question ids"
++        normalized: dict[str, dict[str, list[str]]] = {}
++        for key, value in answers.items():
++            if not isinstance(value, Mapping) or set(value) != {"answers"} or not isinstance(value.get("answers"), list):
++                return None, f"Answer for {key!r} must be an object with an answers string array"
++            if not all(isinstance(item, str) for item in value["answers"]):
++                return None, f"Answer for {key!r} contains a non-string value"
++            normalized[str(key)] = {"answers": list(value["answers"])}
++        return {"answers": normalized}, None
++    if method == "mcpServer/elicitation/request":
++        allowed = {"action", "content", "_meta"}
++        if set(response) - allowed or response.get("action") not in {"accept", "decline", "cancel"}:
++            return None, "MCP elicitation responses require action=accept, decline, or cancel"
++        action = response["action"]
++        content = response.get("content")
++        if action != "accept":
++            if content is not None:
++                return None, "Decline or cancel responses must use content=null"
++            response["content"] = None
++        else:
++            mode = request.params.get("mode")
++            if mode in {"form", "openai/form", "openaiForm"}:
++                if not isinstance(content, Mapping):
++                    return None, "Form elicitation acceptance requires a content object"
++                schema = request.params.get("requestedSchema")
++                if isinstance(schema, Mapping):
++                    error = _validate_form_content(content, schema)
++                    if error is not None:
++                        return None, error
++            elif mode == "url":
++                if content is not None and not isinstance(content, Mapping):
++                    return None, "URL elicitation content must be an object or null"
++            else:
++                return None, f"Unsupported MCP elicitation mode: {mode!r}"
++        if "_meta" in response and response["_meta"] is not None and not isinstance(response["_meta"], Mapping):
++            return None, "MCP elicitation _meta must be an object or null"
++        response.setdefault("content", None)
++        response.setdefault("_meta", None)
++        return response, None
++    return None, f"No response validator exists for {method}"
++
++
++def _permission_subset(granted: Any, requested: Any) -> bool:
++    if not isinstance(granted, Mapping) or not isinstance(requested, Mapping):
++        return not granted
++    for key, value in granted.items():
++        if key not in requested or not _permission_value_subset(value, requested[key]):
++            return False
++    return True
++
++
++def _permission_value_subset(granted: Any, requested: Any) -> bool:
++    if isinstance(granted, Mapping):
++        return isinstance(requested, Mapping) and all(
++            key in requested and _permission_value_subset(value, requested[key])
++            for key, value in granted.items()
++        )
++    if isinstance(granted, list):
++        if not isinstance(requested, list):
++            return False
++        return all(any(item == allowed for allowed in requested) for item in granted)
++    if isinstance(granted, bool):
++        return granted is False or requested is True
++    return granted == requested
++
++
++def _validate_form_content(content: Mapping[str, Any], schema: Mapping[str, Any]) -> str | None:
++    properties = schema.get("properties") if isinstance(schema.get("properties"), Mapping) else {}
++    required = schema.get("required") if isinstance(schema.get("required"), list) else []
++    unknown = set(content) - set(properties)
++    if unknown:
++        return f"Form content contains fields not requested by the MCP schema: {', '.join(sorted(map(str, unknown)))}"
++    missing = [str(key) for key in required if key not in content]
++    if missing:
++        return f"Form content is missing required fields: {', '.join(missing)}"
++    for key, value in content.items():
++        field_schema = properties.get(key)
++        if not isinstance(field_schema, Mapping):
++            continue
++        if "enum" in field_schema and value not in field_schema.get("enum", []):
++            return f"Form field {key!r} is not one of the requested enum values"
++        expected = field_schema.get("type")
++        valid = {
++            "string": isinstance(value, str),
++            "number": isinstance(value, (int, float)) and not isinstance(value, bool),
++            "integer": isinstance(value, int) and not isinstance(value, bool),
++            "boolean": isinstance(value, bool),
++            "array": isinstance(value, list),
++            "object": isinstance(value, Mapping),
++        }.get(expected, True)
++        if not valid:
++            return f"Form field {key!r} has the wrong type for the requested schema"
++    return None
++
+diff --git a/gateway/delivery_ledger.py b/gateway/delivery_ledger.py
+index ae37d36..76b4312 100644
+--- a/gateway/delivery_ledger.py
++++ b/gateway/delivery_ledger.py
+@@ -170 +170,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
+-            adapter_profile TEXT
++            adapter_profile TEXT,
++            codex_notification_id TEXT,
++            codex_notification_state TEXT,
++            codex_notification_generation INTEGER,
++            codex_notification_store_path TEXT,
++            message_id TEXT,
++            continuation_message_ids_json TEXT NOT NULL DEFAULT '[]'
+@@ -173,2 +179,12 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
+-    if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+-        add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
++    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
++    for name, definition in (
++        ("adapter_profile", "adapter_profile TEXT"),
++        ("codex_notification_id", "codex_notification_id TEXT"),
++        ("codex_notification_state", "codex_notification_state TEXT"),
++        ("codex_notification_generation", "codex_notification_generation INTEGER"),
++        ("codex_notification_store_path", "codex_notification_store_path TEXT"),
++        ("message_id", "message_id TEXT"),
++        ("continuation_message_ids_json", "continuation_message_ids_json TEXT NOT NULL DEFAULT '[]'"),
++    ):
++        if name not in columns:
++            add_column_if_missing(conn, "delivery_obligations", name, definition)
+@@ -236 +252,5 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
+-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
++                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
++                      codex_notification_id: Optional[str] = None,
++                      codex_notification_state: Optional[str] = None,
++                      codex_notification_generation: Optional[int] = None,
++                      codex_notification_store_path: Optional[str] = None) -> None:
+@@ -244,2 +264,4 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
+-                owner_pid, owner_started_at, adapter_profile)
+-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
++                owner_pid, owner_started_at, adapter_profile,
++                codex_notification_id, codex_notification_state,
++                codex_notification_generation, codex_notification_store_path)
++               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+@@ -247 +269,5 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
+-             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
++             content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
++             str(codex_notification_id) if codex_notification_id else None,
++             str(codex_notification_state) if codex_notification_state else None,
++             int(codex_notification_generation) if codex_notification_generation is not None else None,
++             str(codex_notification_store_path) if codex_notification_store_path else None))
+@@ -255,2 +281,21 @@ def mark_attempting(obligation_id: str) -> None:
+-def mark_delivered(obligation_id: str) -> None:
+-    _update_state(obligation_id, "delivered")
++def mark_delivered(obligation_id: str, *, message_id: Optional[str] = None,
++                   continuation_message_ids: Optional[tuple] = None) -> None:
++    """Mark delivered and propagate the actual platform receipt to ownerreview."""
++    continuation_ids = tuple(str(value) for value in (continuation_message_ids or ()) if value)
++    with _DB_LOCK, _transaction() as conn:
++        conn.execute(
++            """UPDATE delivery_obligations SET state='delivered', updated_at=?, last_error=NULL,
++                message_id=?, continuation_message_ids_json=? WHERE obligation_id=?""",
++            (time.time(), str(message_id) if message_id else None,
++             json.dumps(list(continuation_ids), separators=(",", ":")), obligation_id),
++        )
++        cursor = conn.execute(
++            """SELECT obligation_id, codex_notification_id, codex_notification_state,
++                      codex_notification_generation, codex_notification_store_path,
++                      message_id, continuation_message_ids_json, state
++                 FROM delivery_obligations WHERE obligation_id=?""",
++            (obligation_id,),
++        )
++        row = cursor.fetchone()
++        columns = [description[0] for description in (cursor.description or ())]
++    _propagate_codex_delivery(_obligation_dict(row, columns))
+@@ -262,0 +308,63 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
++def get_obligation(obligation_id: str) -> Optional[Dict[str, Any]]:
++    """Read one durable obligation, including any external notification receipt."""
++    with _DB_LOCK, _transaction() as conn:
++        cursor = conn.execute("SELECT * FROM delivery_obligations WHERE obligation_id=?", (obligation_id,))
++        row = cursor.fetchone()
++        columns = [description[0] for description in (cursor.description or ())]
++    return _obligation_dict(row, columns) if row is not None else None
++
++
++def find_obligation_for_notification(notification_id: str) -> Optional[Dict[str, Any]]:
++    """Find the one common-ledger row linked to a Codex notification version."""
++    with _DB_LOCK, _transaction() as conn:
++        cursor = conn.execute(
++            "SELECT * FROM delivery_obligations WHERE codex_notification_id=? "
++            "ORDER BY updated_at DESC LIMIT 1", (str(notification_id),)
++        )
++        row = cursor.fetchone()
++        columns = [description[0] for description in (cursor.description or ())]
++    return _obligation_dict(row, columns) if row is not None else None
++
++
++def _obligation_dict(row: Any, columns: Optional[list[str]] = None) -> Dict[str, Any]:
++    if row is None:
++        return {}
++    if hasattr(row, "keys"):
++        columns = list(row.keys())
++    values = dict(zip(columns or (), tuple(row)))
++    try:
++        values["continuation_message_ids"] = tuple(
++            str(value) for value in json.loads(values.get("continuation_message_ids_json") or "[]") if value
++        )
++    except (TypeError, ValueError, json.JSONDecodeError):
++        values["continuation_message_ids"] = ()
++    return values
++
++
++def _propagate_codex_delivery(row: Dict[str, Any]) -> None:
++    if row is None:
++        return
++    codex_id = row.get("codex_notification_id")
++    store_path = row.get("codex_notification_store_path")
++    state = row.get("codex_notification_state")
++    generation = row.get("codex_notification_generation")
++    if not codex_id or not store_path or not state or generation is None:
++        return
++    try:
++        from gateway.codex_app_tasks import mark_codex_notification_delivered
++
++        try:
++            continuation_ids = tuple(
++                str(value) for value in json.loads(row.get("continuation_message_ids_json") or "[]") if value
++            )
++        except (TypeError, ValueError, json.JSONDecodeError):
++            continuation_ids = ()
++        mark_codex_notification_delivered(
++            store_path=str(store_path), notification_id=str(codex_id),
++            expected_state=str(state), generation=int(generation),
++            message_id=row.get("message_id"), continuation_message_ids=continuation_ids,
++        )
++    except Exception:
++        logger.debug("Could not propagate Codex delivery receipt", exc_info=True)
++
++
+diff --git a/gateway/platforms/base.py b/gateway/platforms/base.py
+index 55298cd..6544185 100644
+--- a/gateway/platforms/base.py
++++ b/gateway/platforms/base.py
+@@ -145 +145,8 @@ def _thread_metadata_for_event(event) -> dict | None:
+-    return _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
++    metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
++    notification = (getattr(event, "metadata", None) or {}).get("hermes_codex_notification")
++    if isinstance(notification, dict):
++        metadata = dict(metadata or {})
++        # This internal marker is consumed only by the delivery ledger; keep it
++        # separate from user-visible content and routing identity.
++        metadata["hermes_codex_notification"] = dict(notification)
++    return metadata
+@@ -3807 +3814,2 @@ class BasePlatformAdapter(ABC):
+-        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
++        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool,
++        metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+@@ -3826,0 +3835,5 @@ class BasePlatformAdapter(ABC):
++            _codex_notification = (metadata or {}).get("hermes_codex_notification") if isinstance(metadata, dict) else None
++            _codex_id = _codex_notification.get("notification_id") if isinstance(_codex_notification, dict) else None
++            _codex_state = _codex_notification.get("expected_state") if isinstance(_codex_notification, dict) else None
++            _codex_generation = _codex_notification.get("generation") if isinstance(_codex_notification, dict) else None
++            _codex_store_path = _codex_notification.get("store_path") if isinstance(_codex_notification, dict) else None
+@@ -3832 +3845,17 @@ class BasePlatformAdapter(ABC):
+-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
++                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
++                codex_notification_id=_codex_id,
++                codex_notification_state=_codex_state,
++                codex_notification_generation=_codex_generation,
++                codex_notification_store_path=_codex_store_path)
++            if _codex_id and _codex_state and _codex_generation is not None and _codex_store_path:
++                try:
++                    from gateway.codex_app_tasks import link_codex_notification_to_obligation
++
++                    await asyncio.to_thread(
++                        link_codex_notification_to_obligation,
++                        store_path=str(_codex_store_path), notification_id=str(_codex_id),
++                        expected_state=str(_codex_state), generation=int(_codex_generation),
++                        obligation_id=obligation_id,
++                    )
++                except Exception:
++                    logger.debug("codex notification obligation link failed", exc_info=True)
+@@ -3850 +3879,5 @@ class BasePlatformAdapter(ABC):
+-                await asyncio.to_thread(mark_delivered, obligation_id)
++                await asyncio.to_thread(
++                    mark_delivered, obligation_id,
++                    message_id=getattr(result, "message_id", None),
++                    continuation_message_ids=tuple(getattr(result, "continuation_message_ids", ()) or ()),
++                )
+@@ -3952 +3985 @@ class BasePlatformAdapter(ABC):
+-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
++            event, session_key, text_content, delivery_adapter, is_ephemeral_response, metadata)
+diff --git a/gateway/run_busy.py b/gateway/run_busy.py
+index 2688b95..d767cea 100644
+--- a/gateway/run_busy.py
++++ b/gateway/run_busy.py
+@@ -278 +278 @@ class GatewayBusySessionMixin:
+-        "gateway_session_id", "gateway_session_strict",
++        "gateway_session_id", "gateway_session_strict", "hermes_codex_notification",
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+index 3c5028c..ec2da3e 100644
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -15,0 +16 @@ import json
++import inspect
+@@ -18,0 +20 @@ import time
++from contextvars import copy_context
+@@ -512,0 +515,22 @@ class GatewayInboundMixin:
++
++        # Plugin slash commands are not represented by ``CommandDef``.  They still need the same
++        # inline busy-path treatment as built-ins: an owner-DM response to a live Codex request
++        # must not be queued as ordinary model text or interrupt the agent that delivered the
++        # pending notice.  Keep the access gate before invoking the plugin handler.
++        if _evt_cmd:
++            try:
++                from hermes_cli.plugins import get_plugin_command_handler
++
++                _plugin_command = _evt_cmd.replace("_", "-")
++                if get_plugin_command_handler(_plugin_command):
++                    _denied = self._check_slash_access(source, _plugin_command)
++                    if _denied is not None:
++                        return True, _denied
++                    _handled, _result, _ = await self._hm_dispatch_quick_and_plugin_commands(
++                        event, source, _plugin_command
++                    )
++                    return True, _result if _handled else None
++            except Exception:
++                logger.warning("Busy plugin command dispatch failed: /%s", _evt_cmd, exc_info=True)
++                return True, f"Could not dispatch `/{_evt_cmd}` while the agent is running."
++
+@@ -738,2 +762,6 @@ class GatewayInboundMixin:
+-            _def = _resolve_cmd(cmd) if cmd else None
+-            return _def, (_def.name if _def else cmd)
++            # Plugin dispatch accepts underscore spellings (for example Discord autocomplete may
++            # surface ``/codex_respond`` for a registered ``codex-respond`` command).  Normalize
++            # before the access gate as well; otherwise the spelling could bypass slash policy.
++            normalized = str(cmd or "").replace("_", "-")
++            _def = (_resolve_cmd(cmd) if cmd else None) or (_resolve_cmd(normalized) if normalized else None)
++            return _def, (_def.name if _def else normalized)
+@@ -998,3 +1026,42 @@ class GatewayInboundMixin:
+-                    result = plugin_handler(event.get_command_args().strip())
+-                    if asyncio.iscoroutine(result):
+-                        result = await result
++                    # Plugin slash handlers receive only their raw argument string for API
++                    # compatibility.  Bind the authenticated gateway event around the call so a
++                    # handler cannot reconstruct identity from model text or stale process env.
++                    # Use a child context: set_session_vars() is intentionally clear-on-exit and
++                    # must not erase a caller's unrelated session context.
++                    from gateway.session_context import clear_session_vars, set_session_vars
++                    try:
++                        plugin_session_key = self._session_key_for_source(source)
++                    except Exception:
++                        plugin_session_key = ""
++
++                    async def _invoke_plugin_handler():
++                        tokens = set_session_vars(
++                            platform=source.platform.value if source.platform else "",
++                            source=source.platform.value if source.platform else "",
++                            chat_id=str(source.chat_id or ""),
++                            chat_type=str(source.chat_type or ""),
++                            chat_name=str(source.chat_name or ""),
++                            thread_id=str(source.thread_id or ""),
++                            user_id=str(source.user_id or ""),
++                            user_id_alt=str(source.user_id_alt or ""),
++                            user_name=str(source.user_name or ""),
++                            scope_id=str(getattr(source, "scope_id", None) or ""),
++                            session_key=str(plugin_session_key or ""),
++                            message_id=str(
++                                getattr(event, "message_id", None)
++                                or getattr(source, "message_id", None)
++                                or ""
++                            ),
++                            profile=str(getattr(source, "profile", None) or ""),
++                        )
++                        try:
++                            value = plugin_handler(event.get_command_args().strip())
++                            if inspect.isawaitable(value):
++                                value = await value
++                            return value
++                        finally:
++                            clear_session_vars(tokens)
++
++                    result = await asyncio.create_task(
++                        _invoke_plugin_handler(), context=copy_context()
++                    )
+@@ -1713 +1780 @@ class GatewayInboundMixin:
+-        from hermes_cli.plugins import get_plugin_manager
++        from hermes_cli.plugins import get_plugin_manager, get_plugin_managers
+@@ -1715,3 +1782,7 @@ class GatewayInboundMixin:
+-        get_plugin_manager().set_gateway_message_injector(
+-            self, self._schedule_plugin_message_injection
+-        )
++        managers = get_plugin_managers()
++        primary = get_plugin_manager()
++        if primary not in managers:
++            managers.append(primary)
++        for manager in managers:
++            manager.set_gateway_message_injector(self, self._schedule_plugin_message_injection)
++            manager.notify_gateway_message_injector_ready()
+@@ -1721 +1792 @@ class GatewayInboundMixin:
+-        from hermes_cli.plugins import get_plugin_manager
++        from hermes_cli.plugins import get_plugin_manager, get_plugin_managers
+@@ -1723 +1794,6 @@ class GatewayInboundMixin:
+-        get_plugin_manager().clear_gateway_message_injector(self)
++        managers = get_plugin_managers()
++        primary = get_plugin_manager()
++        if primary not in managers:
++            managers.append(primary)
++        for manager in managers:
++            manager.clear_gateway_message_injector(self)
+@@ -1726 +1802,2 @@ class GatewayInboundMixin:
+-        self, *, session_key: str, content: str, plugin_id: str
++        self, *, session_key: str, content: str, plugin_id: str,
++        metadata: Optional[dict] = None,
+@@ -1734,3 +1811,6 @@ class GatewayInboundMixin:
+-        coro = self._dispatch_plugin_message_injection(
+-            session_key=session_key, content=content, plugin_id=plugin_id,
+-        )
++        dispatch_kwargs = {
++            "session_key": session_key, "content": content, "plugin_id": plugin_id,
++        }
++        if metadata is not None:
++            dispatch_kwargs["metadata"] = metadata
++        coro = self._dispatch_plugin_message_injection(**dispatch_kwargs)
+@@ -1776 +1856,2 @@ class GatewayInboundMixin:
+-        self, *, session_key: str, content: str, plugin_id: str
++        self, *, session_key: str, content: str, plugin_id: str,
++        metadata: Optional[dict] = None,
+@@ -1807,0 +1889,9 @@ class GatewayInboundMixin:
++        event_metadata = {
++            "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
++            "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
++            "gateway_session_strict": True,
++        }
++        if isinstance(metadata, dict):
++            # The gateway owns the event envelope; plugin markers are copied as
++            # data only and cannot change source identity or control flags.
++            event_metadata.update(metadata)
+@@ -1811,5 +1901 @@ class GatewayInboundMixin:
+-            metadata={
+-                "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
+-                "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
+-                "gateway_session_strict": True,
+-            },
++            metadata=event_metadata,
+diff --git a/gateway/run_startup.py b/gateway/run_startup.py
+index 4ee1d76..4456e20 100644
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -400 +400,7 @@ class GatewayStartupMixin:
+-                    await asyncio.to_thread(mark_delivered, row["obligation_id"])
++                    await asyncio.to_thread(
++                        mark_delivered, row["obligation_id"],
++                        message_id=getattr(result, "message_id", None),
++                        continuation_message_ids=tuple(
++                            getattr(result, "continuation_message_ids", ()) or ()
++                        ),
++                    )
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+index 38b586b..5dbcedf 100644
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -261,0 +262,15 @@ class GatewayTurnMixin:
++    @staticmethod
++    def _merge_codex_delivery_metadata(
++        metadata: Optional[Dict[str, Any]], delivery_metadata: Any,
++    ) -> Optional[Dict[str, Any]]:
++        """Carry the internal ownerreview receipt marker through stream sends."""
++        marker = (
++            delivery_metadata.get("hermes_codex_notification")
++            if isinstance(delivery_metadata, dict) else None
++        )
++        if not isinstance(marker, dict):
++            return metadata
++        merged = dict(metadata or {})
++        merged["hermes_codex_notification"] = dict(marker)
++        return merged
++
+@@ -2016,0 +2032,6 @@ class GatewayTurnMixin:
++            _delivery_metadata = None
++            _codex_notification = (getattr(event, "metadata", None) or {}).get(
++                "hermes_codex_notification"
++            )
++            if isinstance(_codex_notification, dict):
++                _delivery_metadata = {"hermes_codex_notification": dict(_codex_notification)}
+@@ -2022,0 +2044 @@ class GatewayTurnMixin:
++                delivery_metadata=_delivery_metadata,
+@@ -2485,0 +2508,8 @@ class GatewayTurnMixin:
++        # Ownerreview completion notices are finalized through the normal
++        # delivery-ledger bracket below.  Stream previews edit/send through a
++        # separate path and cannot provide one durable final-send obligation,
++        # so do not suppress that ledgered final for this internal marker.
++        if isinstance(_thread_metadata, dict) and isinstance(
++            _thread_metadata.get("hermes_codex_notification"), dict
++        ):
++            return None
+@@ -2521,0 +2552 @@ class GatewayTurnMixin:
++        delivery_metadata: Optional[dict] = None,
+@@ -2578,0 +2610 @@ class GatewayTurnMixin:
++        _thread_metadata = self._merge_codex_delivery_metadata(_thread_metadata, delivery_metadata)
+@@ -3562,0 +3595 @@ class GatewayTurnMixin:
++        next_delivery_metadata = None
+@@ -3593,0 +3627,5 @@ class GatewayTurnMixin:
++            _next_codex_notification = (getattr(pending_event, "metadata", None) or {}).get(
++                "hermes_codex_notification"
++            )
++            if isinstance(_next_codex_notification, dict):
++                next_delivery_metadata = {"hermes_codex_notification": dict(_next_codex_notification)}
+@@ -3638,0 +3677 @@ class GatewayTurnMixin:
++                delivery_metadata=next_delivery_metadata,
+@@ -3856,0 +3896,6 @@ class GatewayTurnMixin:
++        turn_ctx._progress_metadata = self._merge_codex_delivery_metadata(
++            turn_ctx._progress_metadata, turn_ctx.delivery_metadata,
++        )
++        _status_thread_metadata = self._merge_codex_delivery_metadata(
++            _status_thread_metadata, turn_ctx.delivery_metadata,
++        )
+@@ -3951,0 +3997 @@ class GatewayTurnMixin:
++        delivery_metadata: Optional[dict] = None,
+@@ -3960,0 +4007 @@ class GatewayTurnMixin:
++                delivery_metadata=delivery_metadata,
+@@ -3975,0 +4023 @@ class GatewayTurnMixin:
++            delivery_metadata=delivery_metadata,
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index cc0824d..03bc26b 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -909,0 +910,9 @@ class TurnRunner:
++        # Completion notices carry an internal ownerreview marker and must end
++        # in the ordinary final-send delivery ledger.  Streaming previews use
++        # edits/frames outside that bracket and would otherwise suppress the
++        # ledgered send before a durable Discord receipt exists.
++        if isinstance(ctx.delivery_metadata, dict) and isinstance(
++            ctx.delivery_metadata.get("hermes_codex_notification"), dict
++        ):
++            want_stream_deltas = False
++            want_interim_messages = False
+diff --git a/gateway/slash_commands.py b/gateway/slash_commands.py
+index 23ea8ad..06c27da 100644
+--- a/gateway/slash_commands.py
++++ b/gateway/slash_commands.py
+@@ -23,0 +24 @@ from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_c
++from gateway.codex_app_tasks import DiscordOrigin, resolve_live_codex_approval
+@@ -98,0 +100,25 @@ def _preview(text: str, limit: int = 60) -> str:
++def _try_live_codex_approval(event: MessageEvent, *, choice: str, prefer_existing: bool) -> tuple[bool, str | None]:
++    """Route ownerreview Codex approvals through the existing /approve surface."""
++    source = event.source
++    if getattr(source, "platform", None) != Platform.DISCORD:
++        return False, None
++    from gateway.session_context import get_session_env
++
++    profile = str(getattr(source, "profile", None) or get_session_env("HERMES_SESSION_PROFILE", "") or "")
++    origin = DiscordOrigin(
++        sender_id=str(getattr(source, "user_id", "") or get_session_env("HERMES_SESSION_USER_ID", "")),
++        conversation_id=str(getattr(source, "chat_id", "") or get_session_env("HERMES_SESSION_CHAT_ID", "")),
++        message_id=str(getattr(event, "message_id", None) or get_session_env("HERMES_SESSION_MESSAGE_ID", "") or "gateway-command"),
++        thread_id=str(getattr(source, "thread_id", None) or get_session_env("HERMES_SESSION_THREAD_ID", "")) or None,
++        conversation_type=str(getattr(source, "chat_type", None) or get_session_env("HERMES_SESSION_CHAT_TYPE", "dm")),
++        platform="discord", profile=profile,
++    )
++    try:
++        return resolve_live_codex_approval(
++            origin=origin, raw_args=event.get_command_args().strip(), choice=choice,
++            prefer_existing_gateway_approval=prefer_existing,
++        )
++    except (ValueError, TypeError):
++        return False, None
++
++
+@@ -1136,0 +1163,8 @@ class GatewaySlashCommandsMixin(
++        from tools.approval import has_blocking_approval
++        codex_handled, codex_reply = _try_live_codex_approval(
++            event, choice="approve", prefer_existing=has_blocking_approval(
++                self._session_key_for_source(event.source)
++            ),
++        )
++        if codex_handled:
++            return codex_reply
+@@ -1160 +1194,8 @@ class GatewaySlashCommandsMixin(
+-        from tools.approval import resolve_gateway_approval
++        from tools.approval import has_blocking_approval, resolve_gateway_approval
++        codex_handled, codex_reply = _try_live_codex_approval(
++            event, choice="deny", prefer_existing=has_blocking_approval(
++                self._session_key_for_source(event.source)
++            ),
++        )
++        if codex_handled:
++            return codex_reply or "Codex request denied."
+diff --git a/gateway/turn_context.py b/gateway/turn_context.py
+index aa2ce65..6f10721 100644
+--- a/gateway/turn_context.py
++++ b/gateway/turn_context.py
+@@ -46,0 +47,3 @@ class TurnContext:
++    # Internal delivery marker for ownerreview notifications.  It is copied to
++    # final-send metadata, never rendered as user content.
++    delivery_metadata: Optional[dict] = None
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 000102b..191b175 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -608,0 +609 @@ class PluginContext:
++        metadata: Mapping[str, Any] | None = None,
+@@ -613 +614,3 @@ class PluginContext:
+-        request for async dispatch, not that delivery completed."""
++        request for async dispatch, not that delivery completed.  ``metadata``
++        is an internal, plugin-owned routing/delivery marker carried to the
++        resulting gateway event; it is never supplied by the model."""
+@@ -632,3 +635,6 @@ class PluginContext:
+-            return bool(self._manager.inject_gateway_message(
+-                session_key=session_key, content=msg, plugin_id=self.plugin_id,
+-            ))
++            injection = {
++                "session_key": session_key, "content": msg, "plugin_id": self.plugin_id,
++            }
++            if metadata is not None:
++                injection["metadata"] = dict(metadata)
++            return bool(self._manager.inject_gateway_message(**injection))
+@@ -639,0 +646,12 @@ class PluginContext:
++    def register_gateway_message_injector_ready(self, callback: Callable[[], None]) -> None:
++        """Run *callback* once a live gateway injector is available for this profile."""
++
++        if not callable(callback):
++            raise TypeError("gateway injector ready callback must be callable")
++        key = str(id(callback))
++        self._manager._register_gateway_injector_ready(self.plugin_id, callback)
++        self._track(
++            "gateway_injector_ready", key,
++            lambda: self._manager._remove_gateway_injector_ready(self.plugin_id, callback),
++        )
++
+@@ -1133,0 +1152 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
++        self._gateway_injector_ready_callbacks: list[tuple[str, Callable[[], None]]] = []
+@@ -1207,0 +1227,23 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
++    def _register_gateway_injector_ready(self, plugin_id: str, callback: Callable[[], None]) -> None:
++        self._gateway_injector_ready_callbacks.append((plugin_id, callback))
++        if self.has_gateway_message_injector:
++            try:
++                callback()
++            except Exception:
++                logger.warning("Plugin %s gateway-injector recovery callback failed", plugin_id, exc_info=True)
++
++    def _remove_gateway_injector_ready(self, plugin_id: str, callback: Callable[[], None]) -> None:
++        self._gateway_injector_ready_callbacks = [
++            item for item in self._gateway_injector_ready_callbacks
++            if item != (plugin_id, callback)
++        ]
++
++    def notify_gateway_message_injector_ready(self) -> None:
++        """Notify profile-local durable plugin workers after injector publication."""
++
++        for plugin_id, callback in list(self._gateway_injector_ready_callbacks):
++            try:
++                callback()
++            except Exception:
++                logger.warning("Plugin %s gateway-injector recovery callback failed", plugin_id, exc_info=True)
++
+@@ -1544,0 +1587,16 @@ def get_plugin_manager() -> PluginManager:
++def get_plugin_managers() -> list[PluginManager]:
++    """Return the live profile-scoped plugin managers in this process.
++
++    Multiplexed gateways install one plugin manager per served profile.  The
++    gateway's single message-injection scheduler must be published to each of
++    those managers so profile-local plugins can use the existing authorization
++    and ``allow_gateway_injection`` gates.
++    """
++
++    with _plugin_managers_lock:
++        managers = list(dict.fromkeys(_plugin_managers_by_home.values()))
++        if _plugin_manager is not None and _plugin_manager not in managers:
++            managers.append(_plugin_manager)
++        return managers
++
++
+diff --git a/tests/agent/transports/test_codex_app_server_session.py b/tests/agent/transports/test_codex_app_server_session.py
+index 7548e59..8828e71 100644
+--- a/tests/agent/transports/test_codex_app_server_session.py
++++ b/tests/agent/transports/test_codex_app_server_session.py
+@@ -10,0 +11 @@ import time
++import threading
+@@ -18,0 +20 @@ from agent.transports.codex_app_server_session import (
++    PendingServerRequest,
+@@ -188,0 +191,13 @@ class TestRunTurn:
++    def test_turn_started_callback_receives_persistable_id(self):
++        client = FakeClient()
++        client.queue_notification(
++            "turn/completed", threadId="t",
++            turn={"id": "turn-fake-001", "status": "completed", "error": None},
++        )
++        started: list[str] = []
++        result = make_session(client).run_turn(
++            "hi", turn_timeout=2.0, on_turn_started=started.append,
++        )
++        assert result.turn_id == "turn-fake-001"
++        assert started == ["turn-fake-001"]
++
+@@ -523,0 +539,171 @@ class TestServerRequestRouting:
++    def test_pending_request_is_answered_off_turn_and_same_turn_continues(self):
++        client = FakeClient()
++        client.queue_server_request(
++            "item/tool/requestUserInput", request_id="input-1", threadId="t", turnId="tu1",
++            itemId="item-1", isBlocking=True,
++            questions=[{"id": "where", "header": "Destination", "question": "Where?"}],
++        )
++        original_respond = client.respond
++
++        def respond_and_release(request_id, response):
++            original_respond(request_id, response)
++            if request_id == "input-1":
++                client.queue_notification(
++                    "item/completed", threadId="t", turnId="tu1",
++                    item={"type": "agentMessage", "id": "m1", "text": "continued"},
++                )
++                client.queue_notification(
++                    "turn/completed", threadId="t",
++                    turn={"id": "tu1", "status": "completed", "error": None},
++                )
++
++        client.respond = respond_and_release
++        session = make_session(client)
++        pending: list[PendingServerRequest] = []
++        outcome: list[Any] = []
++
++        worker = threading.Thread(
++            target=lambda: outcome.append(session.run_turn(
++                "continue", turn_timeout=2.0, notification_poll_timeout=0.01,
++                allow_pending_server_requests=True, on_server_request=pending.append,
++            )),
++            daemon=True,
++        )
++        worker.start()
++        deadline = time.time() + 1.0
++        while not pending and time.time() < deadline:
++            time.sleep(0.005)
++        assert pending and pending[0].request_id == "input-1"
++        assert client.responses == []
++        accepted = session.answer_server_request(
++            "input-1", {"answers": {"where": {"answers": ["Google"]}}},
++        )
++        worker.join(timeout=2)
++        assert accepted.accepted is True
++        assert not worker.is_alive()
++        assert outcome[0].final_text == "continued"
++        assert client.responses == [("input-1", {"answers": {"where": {"answers": ["Google"]}}})]
++
++    def test_pending_request_rejects_wrong_type_and_duplicate_answer(self):
++        client = FakeClient()
++        client.queue_server_request(
++            "mcpServer/elicitation/request", request_id="mcp-1", serverName="hermes-tools",
++            threadId="t", mode="form", message="Choose", requestedSchema={
++                "type": "object", "properties": {"choice": {"type": "string", "enum": ["yes", "no"]}},
++                "required": ["choice"],
++            },
++        )
++        original_respond = client.respond
++
++        def respond_and_release(request_id, response):
++            original_respond(request_id, response)
++            client.queue_notification(
++                "item/completed", threadId="t", turnId="tu1",
++                item={"type": "agentMessage", "id": "m1", "text": "mcp continued"},
++            )
++            client.queue_notification(
++                "turn/completed", threadId="t",
++                turn={"id": "tu1", "status": "completed", "error": None},
++            )
++
++        client.respond = respond_and_release
++        session = make_session(client)
++        pending: list[PendingServerRequest] = []
++        worker = threading.Thread(
++            target=lambda: session.run_turn(
++                "continue", turn_timeout=2.0, notification_poll_timeout=0.01,
++                allow_pending_server_requests=True, on_server_request=pending.append,
++            ),
++            daemon=True,
++        )
++        worker.start()
++        deadline = time.time() + 1.0
++        while not pending and time.time() < deadline:
++            time.sleep(0.005)
++        assert pending
++        assert session.answer_server_request("wrong-id", {"action": "decline"}).reason == "mismatch"
++        assert session.answer_server_request(
++            "mcp-1", {"decision": "accept"}
++        ).reason == "invalid"
++        accepted = session.answer_server_request(
++            "mcp-1", {"action": "accept", "content": {"choice": "yes"}},
++        )
++        duplicate = session.answer_server_request(
++            "mcp-1", {"action": "accept", "content": {"choice": "no"}},
++        )
++        worker.join(timeout=2)
++        assert accepted.accepted is True
++        assert duplicate.reason == "duplicate"
++        assert client.responses == [("mcp-1", {"action": "accept", "content": {"choice": "yes"}, "_meta": None})]
++
++    def test_pending_timeout_uses_type_specific_fail_closed_response(self):
++        client = FakeClient()
++        client.queue_server_request(
++            "item/permissions/requestApproval", request_id="perm-1", threadId="t", turnId="tu1",
++            itemId="item-1", cwd="/tmp", startedAtMs=1,
++            permissions={"network": {"enabled": True}},
++            autoResolutionMs=1,
++        )
++        original_respond = client.respond
++
++        def respond_and_release(request_id, response):
++            original_respond(request_id, response)
++            client.queue_notification(
++                "turn/completed", threadId="t",
++                turn={"id": "tu1", "status": "completed", "error": None},
++            )
++
++        client.respond = respond_and_release
++        result = make_session(client).run_turn(
++            "hi", turn_timeout=1.0, notification_poll_timeout=0.01,
++            allow_pending_server_requests=True,
++        )
++        assert result.error is None
++        assert client.responses == [("perm-1", {"permissions": {}})]
++
++    def test_pending_request_disconnects_without_answering(self):
++        client = FakeClient()
++        client.queue_server_request(
++            "item/commandExecution/requestApproval", request_id="exec-1", command="echo hi", cwd="/tmp",
++        )
++        session = make_session(client)
++        pending: list[PendingServerRequest] = []
++        worker = threading.Thread(
++            target=lambda: pending.append(session.run_turn(
++                "hi", turn_timeout=2.0, notification_poll_timeout=0.01,
++                allow_pending_server_requests=True,
++            )),
++            daemon=True,
++        )
++        # The lambda above intentionally records the TurnResult in the same
++        # list type only to keep the test's synchronization compact.
++        worker.start()
++        deadline = time.time() + 1.0
++        while session.pending_server_request() is None and time.time() < deadline:
++            time.sleep(0.005)
++        client._closed = True
++        worker.join(timeout=2)
++        assert not worker.is_alive()
++        result = pending[0]
++        assert result.should_retire is True
++        assert "disconnected" in (result.error or "")
++        assert client.responses == []
++
++    def test_elicitation_is_declined_and_marked_waiting_without_auto_accept(self):
++        client = FakeClient()
++        client.queue_server_request(
++            "mcpServer/elicitation/request", request_id="elicitation-1", serverName="hermes-tools",
++        )
++        result = make_session(client).run_turn("hi", turn_timeout=1.0)
++        assert client.responses == [("elicitation-1", {"action": "decline", "content": None, "_meta": None})]
++        assert result.waiting_for_user is True
++        assert result.server_request_kind == "waiting_for_user"
++        assert "user-answer route" in (result.server_request_summary or "")
++
++    def test_structured_user_input_is_explicitly_unsupported_and_waiting(self):
++        client = FakeClient()
++        client.queue_server_request("tool/requestUserInput", request_id="input-1")
++        result = make_session(client).run_turn("hi", turn_timeout=1.0)
++        assert result.waiting_for_user is True
++        assert any(rid == "input-1" and code == -32000 for rid, code, _ in client.error_responses)
++
+@@ -913 +1098,0 @@ class TestClassifyOAuthFailure:
+-
+diff --git a/gateway/codex_app_tasks.py b/gateway/codex_app_tasks.py
+new file mode 100644
+index 0000000..67e00cd
+--- /dev/null
++++ b/gateway/codex_app_tasks.py
+@@ -0,0 +1,1657 @@
++"""Hermes -> Codex app-server task adapter.
++
++This module keeps Discord and gateway routing outside the Codex executor while
++providing the durable boundary used by the owner-DM integration:
++
++* a request envelope whose reply target is derived from the Discord event;
++* an SQLite mapping from Hermes request ids to Codex thread/turn ids;
++* idempotent admission for a retried Discord message;
++* conservative state transitions, including ``unknown`` for transport
++  uncertainty; and
++* a Codex app-server executor plus a read-only reconciliation path; and
++* restart-safe, versioned completion-delivery bookkeeping.
++
++The module is safe to exercise with a temporary database.  Production callers
++must pass an explicit state-store path and must opt in to the asynchronous
++executor.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import inspect
++import json
++import logging
++import os
++import shlex
++import sqlite3
++import threading
++import time
++import uuid
++from concurrent.futures import Future, ThreadPoolExecutor
++from dataclasses import dataclass
++from enum import StrEnum
++from pathlib import Path
++from typing import Any, Callable, Mapping, Protocol
++
++logger = logging.getLogger(__name__)
++
++
++class TaskState(StrEnum):
++    QUEUED = "queued"
++    RUNNING = "running"
++    WAITING_FOR_USER = "waiting_for_user"
++    SUCCEEDED = "succeeded"
++    FAILED = "failed"
++    CANCELLED = "cancelled"
++    UNKNOWN = "unknown"
++
++
++TERMINAL_STATES = frozenset({TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED})
++
++_ALLOWED_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
++    TaskState.QUEUED: frozenset({TaskState.QUEUED, TaskState.RUNNING, TaskState.CANCELLED, TaskState.UNKNOWN}),
++    TaskState.RUNNING: frozenset({
++        TaskState.RUNNING, TaskState.WAITING_FOR_USER, TaskState.SUCCEEDED,
++        TaskState.FAILED, TaskState.CANCELLED, TaskState.UNKNOWN,
++    }),
++    TaskState.WAITING_FOR_USER: frozenset({
++        TaskState.WAITING_FOR_USER, TaskState.RUNNING, TaskState.SUCCEEDED,
++        TaskState.FAILED, TaskState.CANCELLED, TaskState.UNKNOWN,
++    }),
++    TaskState.UNKNOWN: frozenset({
++        TaskState.UNKNOWN, TaskState.RUNNING, TaskState.WAITING_FOR_USER,
++        TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED,
++    }),
++    TaskState.SUCCEEDED: frozenset({TaskState.SUCCEEDED}),
++    TaskState.FAILED: frozenset({TaskState.FAILED}),
++    TaskState.CANCELLED: frozenset({TaskState.CANCELLED}),
++}
++
++
++class TaskConflictError(RuntimeError):
++    """Raised when one Discord message is reused for a different request."""
++
++
++class InvalidStateTransition(RuntimeError):
++    """Raised when a task would move to an unsafe state."""
++
++
++@dataclass(frozen=True, slots=True)
++class DiscordOrigin:
++    """Identity taken from an inbound Discord event.
++
++    The model plan never supplies these fields.  In particular,
++    ``reply_conversation_id`` is derived from ``conversation_id`` and cannot be
++    redirected by text generated by Hermes or Codex.
++    """
++
++    sender_id: str
++    conversation_id: str
++    message_id: str
++    thread_id: str | None = None
++    conversation_type: str = "dm"
++    platform: str = "discord"
++    profile: str | None = None
++
++    def __post_init__(self) -> None:
++        for name in ("sender_id", "conversation_id", "message_id", "conversation_type", "platform"):
++            if not str(getattr(self, name) or "").strip():
++                raise ValueError(f"{name} is required")
++
++    @property
++    def reply_target(self) -> dict[str, str | None]:
++        """Return the only reply destination the bridge is allowed to use."""
++
++        return {
++            "platform": self.platform,
++            "conversation_id": self.conversation_id,
++            "thread_id": self.thread_id,
++        }
++
++    @property
++    def dedupe_key(self) -> tuple[str, str, str]:
++        return self.platform, self.conversation_id, self.message_id
++
++
++@dataclass(frozen=True, slots=True)
++class TaskPlan:
++    """The Hermes-authored execution plan sent to Codex."""
++
++    purpose: str
++    steps: tuple[str, ...]
++    target_services: tuple[str, ...]
++    scope: str
++    completion_conditions: tuple[str, ...]
++
++    def __post_init__(self) -> None:
++        if not self.purpose.strip():
++            raise ValueError("purpose is required")
++        if not self.scope.strip():
++            raise ValueError("scope is required")
++        if not self.completion_conditions:
++            raise ValueError("at least one completion condition is required")
++
++    @classmethod
++    def from_mapping(cls, raw: Mapping[str, Any]) -> "TaskPlan":
++        """Accept only plan fields; routing/delivery fields are intentionally ignored."""
++
++        def strings(value: Any) -> tuple[str, ...]:
++            if value is None:
++                return ()
++            if isinstance(value, str):
++                return (value.strip(),) if value.strip() else ()
++            return tuple(str(item).strip() for item in value if str(item).strip())
++
++        return cls(
++            purpose=str(raw.get("purpose") or "").strip(),
++            steps=strings(raw.get("steps") or raw.get("procedure")),
++            target_services=strings(raw.get("target_services") or raw.get("services")),
++            scope=str(raw.get("scope") or "").strip(),
++            completion_conditions=strings(raw.get("completion_conditions") or raw.get("done_when")),
++        )
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "purpose": self.purpose,
++            "steps": list(self.steps),
++            "target_services": list(self.target_services),
++            "scope": self.scope,
++            "completion_conditions": list(self.completion_conditions),
++        }
++
++
++@dataclass(frozen=True, slots=True)
++class TaskRequest:
++    request_id: str
++    origin: DiscordOrigin
++    plan: TaskPlan
++    created_at: float
++
++    @property
++    def reply_target(self) -> dict[str, str | None]:
++        return self.origin.reply_target
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "request_id": self.request_id,
++            "origin": {
++                "platform": self.origin.platform,
++                "sender_id": self.origin.sender_id,
++                "conversation_id": self.origin.conversation_id,
++                "thread_id": self.origin.thread_id,
++                "message_id": self.origin.message_id,
++                "conversation_type": self.origin.conversation_type,
++                "profile": self.origin.profile,
++            },
++            "plan": self.plan.to_dict(),
++            "reply_target": self.reply_target,
++            "created_at": self.created_at,
++        }
++
++
++def build_task_request(
++    origin: DiscordOrigin,
++    plan: Mapping[str, Any] | TaskPlan,
++    *,
++    request_id: str | None = None,
++    now: float | None = None,
++) -> TaskRequest:
++    """Build a request from a Discord event and an Hermes plan.
++
++    A mapping may contain an untrusted ``reply_target`` key from a model output;
++    it is ignored because the reply destination comes only from ``origin``.
++    """
++
++    task_plan = plan if isinstance(plan, TaskPlan) else TaskPlan.from_mapping(plan)
++    stable_request_id = request_id or str(
++        uuid.uuid5(
++            uuid.NAMESPACE_URL,
++            f"hermes-discord:{origin.platform}:{origin.conversation_id}:{origin.message_id}",
++        )
++    )
++    return TaskRequest(
++        request_id=stable_request_id,
++        origin=origin,
++        plan=task_plan,
++        created_at=float(time.time() if now is None else now),
++    )
++
++
++def render_codex_prompt(request: TaskRequest) -> str:
++    """Render the task payload without exposing Discord routing metadata."""
++
++    payload = {
++        "request_id": request.request_id,
++        "purpose": request.plan.purpose,
++        "steps": list(request.plan.steps),
++        "target_services": list(request.plan.target_services),
++        "scope": request.plan.scope,
++        "completion_conditions": list(request.plan.completion_conditions),
++    }
++    return (
++        "You are executing a bounded Hermes request. Keep all actions within the stated scope. "
++        "Do not send Discord messages or choose a reply destination. If a permission, login, or "
++        "human confirmation is required, stop and report that requirement instead of guessing.\n\n"
++        + json.dumps(payload, ensure_ascii=False, sort_keys=True)
++    )
++
++
++@dataclass(frozen=True, slots=True)
++class TaskRecord:
++    request: TaskRequest
++    state: TaskState
++    codex_thread_id: str | None
++    codex_turn_id: str | None
++    result_text: str | None
++    error_text: str | None
++    updated_at: float
++    delivery_state: str = "pending"
++    delivery_attempts: int = 0
++    delivery_error: str | None = None
++    delivery_notice_state: str | None = None
++    pending_server_request_id: str | None = None
++    pending_server_request_method: str | None = None
++    pending_server_request_summary: str | None = None
++    pending_server_request_expires_at: float | None = None
++
++
++@dataclass(frozen=True, slots=True)
++class TaskNotification:
++    """One owner-DM notification version, separate for each state/RPC identity."""
++
++    notification_id: str
++    task_id: str
++    generation: int
++    expected_state: TaskState
++    server_request_id: str | None
++    content: str
++    status: str
++    attempts: int
++    error_text: str | None
++    delivery_obligation_id: str | None
++    message_id: str | None
++    continuation_message_ids: tuple[str, ...]
++    created_at: float
++    updated_at: float
++
++
++@dataclass(frozen=True, slots=True)
++class ExecutionResult:
++    state: TaskState
++    codex_thread_id: str | None = None
++    codex_turn_id: str | None = None
++    result_text: str | None = None
++    error_text: str | None = None
++
++
++@dataclass(frozen=True, slots=True)
++class TaskAnswerResult:
++    """Safe result returned to an authenticated off-turn answer command."""
++
++    accepted: bool
++    status: str
++    message: str
++
++
++_UNSET = object()
++
++
++def _canonical_request(request: TaskRequest) -> str:
++    # A replay of one inbound event must compare equal even when processed at a
++    # different time.  The event identity and plan define the fingerprint;
++    # generated timestamps and request ids do not.
++    payload = request.to_dict()
++    payload.pop("request_id", None)
++    payload.pop("created_at", None)
++    payload.pop("reply_target", None)
++    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
++
++
++def _request_fingerprint(request: TaskRequest) -> str:
++    return hashlib.sha256(_canonical_request(request).encode("utf-8")).hexdigest()
++
++
++class CodexTaskStore:
++    """Thread-safe SQLite store for the bridge's request/task mapping."""
++
++    def __init__(self, path: str | os.PathLike[str]) -> None:
++        self.path = Path(path)
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        self._lock = threading.RLock()
++        self._conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=10.0)
++        self._conn.row_factory = sqlite3.Row
++        with self._lock:
++            self._conn.execute("PRAGMA journal_mode=WAL")
++            self._conn.execute("PRAGMA busy_timeout=10000")
++            self._conn.executescript(
++                """
++                CREATE TABLE IF NOT EXISTS codex_app_tasks (
++                    request_id TEXT PRIMARY KEY,
++                    source_platform TEXT NOT NULL,
++                    source_sender_id TEXT NOT NULL,
++                    source_conversation_id TEXT NOT NULL,
++                    source_thread_id TEXT,
++                    source_message_id TEXT NOT NULL,
++                    conversation_type TEXT NOT NULL,
++                    source_profile TEXT,
++                    purpose TEXT NOT NULL,
++                    steps_json TEXT NOT NULL,
++                    target_services_json TEXT NOT NULL,
++                    scope_text TEXT NOT NULL,
++                    completion_conditions_json TEXT NOT NULL,
++                    reply_platform TEXT NOT NULL,
++                    reply_conversation_id TEXT NOT NULL,
++                    reply_thread_id TEXT,
++                    state TEXT NOT NULL,
++                    codex_thread_id TEXT,
++                    codex_turn_id TEXT,
++                    result_text TEXT,
++                    error_text TEXT,
++                    fingerprint TEXT NOT NULL,
++                    created_at REAL NOT NULL,
++                    updated_at REAL NOT NULL,
++                    delivery_state TEXT NOT NULL DEFAULT 'pending',
++                    delivery_attempts INTEGER NOT NULL DEFAULT 0,
++                    delivery_error TEXT,
++                    delivery_notice_state TEXT,
++                    pending_server_request_id TEXT,
++                    pending_server_request_method TEXT,
++                    pending_server_request_summary TEXT,
++                    pending_server_request_expires_at REAL,
++                    UNIQUE(source_platform, source_conversation_id, source_message_id)
++                );
++                CREATE INDEX IF NOT EXISTS codex_app_tasks_state_idx
++                    ON codex_app_tasks(state, updated_at);
++                CREATE TABLE IF NOT EXISTS codex_task_notifications (
++                    notification_id TEXT PRIMARY KEY,
++                    task_id TEXT NOT NULL,
++                    generation INTEGER NOT NULL,
++                    expected_state TEXT NOT NULL,
++                    server_request_id TEXT,
++                    content TEXT NOT NULL,
++                    status TEXT NOT NULL DEFAULT 'pending',
++                    attempts INTEGER NOT NULL DEFAULT 0,
++                    error_text TEXT,
++                    delivery_obligation_id TEXT,
++                    message_id TEXT,
++                    continuation_message_ids_json TEXT NOT NULL DEFAULT '[]',
++                    created_at REAL NOT NULL,
++                    updated_at REAL NOT NULL,
++                    UNIQUE(task_id, expected_state, server_request_id)
++                );
++                CREATE INDEX IF NOT EXISTS codex_task_notifications_recovery_idx
++                    ON codex_task_notifications(status, updated_at);
++                """
++            )
++            self._ensure_schema_columns()
++            self._migrate_fingerprints()
++            self._conn.commit()
++        # The store can contain Discord routing metadata and results.  Keep the
++        # file private even when the caller created it with a permissive umask.
++        try:
++            os.chmod(self.path, 0o600)
++        except OSError:
++            logger.debug("could not tighten task store permissions", exc_info=True)
++
++    def close(self) -> None:
++        with self._lock:
++            self._conn.close()
++
++    def __enter__(self) -> "CodexTaskStore":
++        return self
++
++    def __exit__(self, *_exc: Any) -> None:
++        self.close()
++
++    def _ensure_schema_columns(self) -> None:
++        """Add fields introduced after the first private-store version."""
++
++        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(codex_app_tasks)")}
++        additions = {
++            "source_profile": "TEXT",
++            "delivery_state": "TEXT NOT NULL DEFAULT 'pending'",
++            "delivery_attempts": "INTEGER NOT NULL DEFAULT 0",
++            "delivery_error": "TEXT",
++            "delivery_notice_state": "TEXT",
++            "pending_server_request_id": "TEXT",
++            "pending_server_request_method": "TEXT",
++            "pending_server_request_summary": "TEXT",
++            "pending_server_request_expires_at": "REAL",
++        }
++        for name, definition in additions.items():
++            if name not in columns:
++                self._conn.execute(f"ALTER TABLE codex_app_tasks ADD COLUMN {name} {definition}")
++
++    def _migrate_fingerprints(self) -> None:
++        """Normalize hashes written by the pre-replay-safe schema."""
++
++        rows = self._conn.execute("SELECT * FROM codex_app_tasks").fetchall()
++        for row in rows:
++            request = self._record(row)
++            fingerprint = _request_fingerprint(request.request)
++            if row["fingerprint"] != fingerprint:
++                self._conn.execute(
++                    "UPDATE codex_app_tasks SET fingerprint=? WHERE request_id=?",
++                    (fingerprint, request.request.request_id),
++                )
++
++    def register(self, request: TaskRequest) -> tuple[TaskRecord, bool]:
++        """Insert a task, or return the exact prior task for a retried message."""
++
++        fingerprint = _request_fingerprint(request)
++        origin, plan = request.origin, request.plan
++        with self._lock:
++            self._conn.execute("BEGIN IMMEDIATE")
++            try:
++                existing = self._conn.execute(
++                    "SELECT * FROM codex_app_tasks WHERE source_platform=? AND source_conversation_id=? "
++                    "AND source_message_id=?",
++                    origin.dedupe_key,
++                ).fetchone()
++                if existing is not None:
++                    if existing["fingerprint"] != fingerprint:
++                        raise TaskConflictError(
++                            "Discord message was already admitted with a different task payload"
++                        )
++                    self._conn.commit()
++                    return self._record(existing), False
++                self._conn.execute(
++                    """
++                    INSERT INTO codex_app_tasks (
++                        request_id, source_platform, source_sender_id, source_conversation_id,
++                        source_thread_id, source_message_id, conversation_type, source_profile, purpose, steps_json,
++                        target_services_json, scope_text, completion_conditions_json, reply_platform,
++                        reply_conversation_id, reply_thread_id, state, fingerprint, created_at, updated_at
++                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                    """,
++                    (
++                        request.request_id, origin.platform, origin.sender_id, origin.conversation_id,
++                        origin.thread_id, origin.message_id, origin.conversation_type, origin.profile, plan.purpose,
++                        _json_array(plan.steps), _json_array(plan.target_services), plan.scope,
++                        _json_array(plan.completion_conditions), origin.platform, origin.conversation_id,
++                        origin.thread_id, TaskState.QUEUED.value, fingerprint, request.created_at, request.created_at,
++                    ),
++                )
++                self._conn.commit()
++                return self.get(request.request_id), True
++            except Exception:
++                self._conn.rollback()
++                raise
++
++    def get(self, request_id: str) -> TaskRecord:
++        with self._lock:
++            row = self._conn.execute("SELECT * FROM codex_app_tasks WHERE request_id=?", (request_id,)).fetchone()
++        if row is None:
++            raise KeyError(request_id)
++        return self._record(row)
++
++    def pending_for_origin(
++        self, *, platform: str, profile: str | None, conversation_id: str, sender_id: str,
++    ) -> list[TaskRecord]:
++        """Return only live waiting requests for one authenticated origin."""
++        with self._lock:
++            rows = self._conn.execute(
++                "SELECT * FROM codex_app_tasks WHERE state=? AND source_platform=? "
++                "AND source_profile IS ? AND source_conversation_id=? AND source_sender_id=? "
++                "AND pending_server_request_id IS NOT NULL ORDER BY updated_at ASC",
++                (TaskState.WAITING_FOR_USER.value, platform, profile, conversation_id, sender_id),
++            ).fetchall()
++        return [self._record(row) for row in rows]
++
++    def recoverable(self) -> list[TaskRecord]:
++        with self._lock:
++            rows = self._conn.execute(
++                "SELECT * FROM codex_app_tasks WHERE state IN (?, ?, ?, ?) ORDER BY updated_at ASC",
++                (
++                    TaskState.QUEUED.value, TaskState.RUNNING.value,
++                    TaskState.WAITING_FOR_USER.value, TaskState.UNKNOWN.value,
++                ),
++            ).fetchall()
++        return [self._record(row) for row in rows]
++
++    def undelivered(self) -> list[TaskRecord]:
++        """Return settled/waiting records whose completion notice is not confirmed."""
++
++        with self._lock:
++            rows = self._conn.execute(
++                "SELECT * FROM codex_app_tasks WHERE state IN (?, ?, ?, ?) "
++                "AND COALESCE(delivery_state, 'pending') != 'delivered' ORDER BY updated_at ASC",
++                (
++                    TaskState.WAITING_FOR_USER.value, TaskState.SUCCEEDED.value,
++                    TaskState.FAILED.value, TaskState.CANCELLED.value,
++                ),
++            ).fetchall()
++        return [self._record(row) for row in rows]
++
++    def ensure_notification(self, record: TaskRecord, content: str) -> TaskNotification:
++        """Create one durable notification version, or return the existing one.
++
++        ``waiting_for_user`` is keyed by the live server-request id, so two MCP
++        requests on one task cannot share an acknowledgement.  Terminal state
++        notices are keyed by the task state and have their own generation.
++        """
++        expected_state = TaskState(record.state)
++        server_request_id = (
++            str(record.pending_server_request_id)
++            if expected_state == TaskState.WAITING_FOR_USER and record.pending_server_request_id
++            else None
++        )
++        content = str(content or "")
++        with self._lock:
++            self._conn.execute("BEGIN IMMEDIATE")
++            try:
++                if server_request_id is None:
++                    existing = self._conn.execute(
++                        "SELECT * FROM codex_task_notifications WHERE task_id=? AND expected_state=? "
++                        "AND server_request_id IS NULL ORDER BY generation DESC LIMIT 1",
++                        (record.request.request_id, expected_state.value),
++                    ).fetchone()
++                else:
++                    existing = self._conn.execute(
++                        "SELECT * FROM codex_task_notifications WHERE task_id=? AND expected_state=? "
++                        "AND server_request_id=? ORDER BY generation DESC LIMIT 1",
++                        (record.request.request_id, expected_state.value, server_request_id),
++                    ).fetchone()
++                if existing is not None:
++                    self._conn.commit()
++                    return self._notification(existing)
++                next_generation = self._conn.execute(
++                    "SELECT COALESCE(MAX(generation), 0) + 1 FROM codex_task_notifications WHERE task_id=?",
++                    (record.request.request_id,),
++                ).fetchone()[0]
++                now = time.time()
++                notification_id = str(uuid.uuid4())
++                self._conn.execute(
++                    """INSERT INTO codex_task_notifications (
++                        notification_id, task_id, generation, expected_state, server_request_id,
++                        content, status, attempts, created_at, updated_at
++                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)""",
++                    (
++                        notification_id, record.request.request_id, int(next_generation), expected_state.value,
++                        server_request_id, content, now, now,
++                    ),
++                )
++                self._conn.commit()
++                return self.notification(notification_id)
++            except Exception:
++                self._conn.rollback()
++                raise
++
++    def notification(self, notification_id: str) -> TaskNotification:
++        with self._lock:
++            row = self._conn.execute(
++                "SELECT * FROM codex_task_notifications WHERE notification_id=?", (notification_id,)
++            ).fetchone()
++        if row is None:
++            raise KeyError(notification_id)
++        return self._notification(row)
++
++    def unresolved_notifications(self) -> list[TaskNotification]:
++        """Return only new notification rows lacking a confirmed platform receipt."""
++        with self._lock:
++            rows = self._conn.execute(
++                "SELECT * FROM codex_task_notifications WHERE status NOT IN ('delivered', 'superseded') "
++                "ORDER BY updated_at ASC"
++            ).fetchall()
++        return [self._notification(row) for row in rows]
++
++    def mark_notification_attempt(self, notification_id: str, *, force: bool = False) -> TaskNotification:
++        with self._lock:
++            where = "notification_id=?"
++            params: list[Any] = [notification_id]
++            if not force:
++                where += " AND status NOT IN ('delivered', 'injected')"
++            self._conn.execute(
++                f"UPDATE codex_task_notifications SET status='attempting', attempts=attempts+1, "
++                f"error_text=NULL, updated_at=? WHERE {where}",
++                [time.time(), *params],
++            )
++            self._conn.commit()
++            return self.notification(notification_id)
++
++    def mark_notification_injected(
++        self, notification_id: str, *, expected_state: TaskState, generation: int,
++    ) -> bool:
++        """Record gateway admission only; this is never a delivery acknowledgement."""
++        with self._lock:
++            cursor = self._conn.execute(
++                "UPDATE codex_task_notifications SET status='injected', error_text=NULL, updated_at=? "
++                "WHERE notification_id=? AND expected_state=? AND generation=? AND status != 'delivered'",
++                (time.time(), notification_id, TaskState(expected_state).value, int(generation)),
++            )
++            self._conn.commit()
++            return bool(cursor.rowcount)
++
++    def mark_notification_failed(self, notification_id: str, error_text: str) -> TaskNotification:
++        with self._lock:
++            self._conn.execute(
++                "UPDATE codex_task_notifications SET status='pending', error_text=?, updated_at=? "
++                "WHERE notification_id=? AND status != 'delivered'",
++                (str(error_text or "")[:1000], time.time(), notification_id),
++            )
++            self._conn.commit()
++            return self.notification(notification_id)
++
++    def mark_notification_superseded(self, notification_id: str, reason: str) -> TaskNotification:
++        """Retire an unconfirmed notice whose task has advanced to another version."""
++        with self._lock:
++            self._conn.execute(
++                "UPDATE codex_task_notifications SET status='superseded', error_text=?, updated_at=? "
++                "WHERE notification_id=? AND status != 'delivered'",
++                (str(reason or "Superseded by a newer task state")[:1000], time.time(), notification_id),
++            )
++            self._conn.commit()
++            return self.notification(notification_id)
++
++    def link_notification_obligation(
++        self, notification_id: str, *, expected_state: TaskState, generation: int,
++        obligation_id: str,
++    ) -> bool:
++        """CAS-link the common delivery-ledger row to this notification version."""
++        with self._lock:
++            cursor = self._conn.execute(
++                "UPDATE codex_task_notifications SET delivery_obligation_id=?, updated_at=? "
++                "WHERE notification_id=? AND expected_state=? AND generation=? "
++                "AND (delivery_obligation_id IS NULL OR delivery_obligation_id=?)",
++                (
++                    str(obligation_id), time.time(), notification_id,
++                    TaskState(expected_state).value, int(generation), str(obligation_id),
++                ),
++            )
++            self._conn.commit()
++            return bool(cursor.rowcount)
++
++    def mark_notification_delivered(
++        self, notification_id: str, *, expected_state: TaskState, generation: int,
++        message_id: str | None, continuation_message_ids: tuple[str, ...] = (),
++    ) -> bool:
++        """CAS a notification to delivered with the platform's actual receipt.
++
++        The expected state and generation are part of the update predicate.  A
++        delayed ACK for an older waiting notice therefore cannot mark a later
++        succeeded notice as delivered.
++        """
++        ids = tuple(str(value) for value in continuation_message_ids if value)
++        with self._lock:
++            cursor = self._conn.execute(
++                """UPDATE codex_task_notifications SET status='delivered', error_text=NULL,
++                    message_id=?, continuation_message_ids_json=?, updated_at=?
++                   WHERE notification_id=? AND expected_state=? AND generation=?
++                     AND status != 'delivered'""",
++                (
++                    str(message_id) if message_id else None, json.dumps(list(ids), separators=(",", ":")),
++                    time.time(), notification_id, TaskState(expected_state).value, int(generation),
++                ),
++            )
++            self._conn.commit()
++            return bool(cursor.rowcount)
++
++    def _notification(self, row: sqlite3.Row) -> TaskNotification:
++        try:
++            continuation_ids = tuple(str(value) for value in json.loads(row["continuation_message_ids_json"] or "[]"))
++        except (TypeError, ValueError, json.JSONDecodeError):
++            continuation_ids = ()
++        return TaskNotification(
++            notification_id=row["notification_id"], task_id=row["task_id"],
++            generation=int(row["generation"]), expected_state=TaskState(row["expected_state"]),
++            server_request_id=row["server_request_id"], content=row["content"], status=row["status"],
++            attempts=int(row["attempts"] or 0), error_text=row["error_text"],
++            delivery_obligation_id=row["delivery_obligation_id"], message_id=row["message_id"],
++            continuation_message_ids=continuation_ids, created_at=float(row["created_at"]),
++            updated_at=float(row["updated_at"]),
++        )
++
++    def mark_delivery_attempt(self, request_id: str, error_text: str | None = None) -> TaskRecord:
++        with self._lock:
++            self._conn.execute(
++                "UPDATE codex_app_tasks SET delivery_state='attempting', "
++                "delivery_attempts=delivery_attempts+1, delivery_error=?, updated_at=? "
++                "WHERE request_id=?",
++                (error_text, time.time(), request_id),
++            )
++            self._conn.commit()
++            return self.get(request_id)
++
++    def mark_delivery_failed(self, request_id: str, error_text: str) -> TaskRecord:
++        with self._lock:
++            self._conn.execute(
++                "UPDATE codex_app_tasks SET delivery_state='pending', delivery_error=?, "
++                "delivery_notice_state=NULL, updated_at=? "
++                "WHERE request_id=?",
++                (error_text, time.time(), request_id),
++            )
++            self._conn.commit()
++            return self.get(request_id)
++
++    def mark_delivery_accepted(self, request_id: str, state: TaskState) -> TaskRecord:
++        """Record gateway injection acceptance, not confirmed Discord delivery."""
++
++        with self._lock:
++            self._conn.execute(
++                "UPDATE codex_app_tasks SET delivery_state='accepted', delivery_error=NULL, "
++                "delivery_notice_state=?, updated_at=? "
++                "WHERE request_id=?",
++                (TaskState(state).value, time.time(), request_id),
++            )
++            self._conn.commit()
++            return self.get(request_id)
++
++    def mark_delivered(self, request_id: str) -> TaskRecord:
++        with self._lock:
++            self._conn.execute(
++                "UPDATE codex_app_tasks SET delivery_state='delivered', delivery_error=NULL, "
++                "delivery_notice_state=(SELECT state FROM codex_app_tasks WHERE request_id=?), updated_at=? "
++                "WHERE request_id=?",
++                (request_id, time.time(), request_id),
++            )
++            self._conn.commit()
++            return self.get(request_id)
++
++    def transition(
++        self,
++        request_id: str,
++        state: TaskState,
++        *,
++        codex_thread_id: str | None | object = _UNSET,
++        codex_turn_id: str | None | object = _UNSET,
++        result_text: str | None | object = _UNSET,
++        error_text: str | None | object = _UNSET,
++        pending_server_request_id: str | None | object = _UNSET,
++        pending_server_request_method: str | None | object = _UNSET,
++        pending_server_request_summary: str | None | object = _UNSET,
++        pending_server_request_expires_at: float | None | object = _UNSET,
++        now: float | None = None,
++    ) -> TaskRecord:
++        state = TaskState(state)
++        with self._lock:
++            current = self.get(request_id)
++            if state not in _ALLOWED_TRANSITIONS[current.state]:
++                raise InvalidStateTransition(f"{current.state.value} -> {state.value}")
++            fields: dict[str, Any] = {"state": state.value, "updated_at": float(time.time() if now is None else now)}
++            for column, value in (
++                ("codex_thread_id", codex_thread_id), ("codex_turn_id", codex_turn_id),
++                ("result_text", result_text), ("error_text", error_text),
++                ("pending_server_request_id", pending_server_request_id),
++                ("pending_server_request_method", pending_server_request_method),
++                ("pending_server_request_summary", pending_server_request_summary),
++                ("pending_server_request_expires_at", pending_server_request_expires_at),
++            ):
++                if value is not _UNSET:
++                    fields[column] = value
++            assignments = ", ".join(f"{column}=?" for column in fields)
++            values = [fields[column] for column in fields] + [request_id]
++            self._conn.execute(f"UPDATE codex_app_tasks SET {assignments} WHERE request_id=?", values)
++            self._conn.commit()
++            return self.get(request_id)
++
++    def _record(self, row: sqlite3.Row) -> TaskRecord:
++        origin = DiscordOrigin(
++            sender_id=row["source_sender_id"], conversation_id=row["source_conversation_id"],
++            message_id=row["source_message_id"], thread_id=row["source_thread_id"],
++            conversation_type=row["conversation_type"], platform=row["source_platform"],
++            profile=row["source_profile"] if "source_profile" in row.keys() else None,
++        )
++        plan = TaskPlan(
++            purpose=row["purpose"], steps=tuple(_load_array(row["steps_json"])),
++            target_services=tuple(_load_array(row["target_services_json"])), scope=row["scope_text"],
++            completion_conditions=tuple(_load_array(row["completion_conditions_json"])),
++        )
++        request = TaskRequest(
++            request_id=row["request_id"], origin=origin, plan=plan, created_at=float(row["created_at"]),
++        )
++        return TaskRecord(
++            request=request, state=TaskState(row["state"]), codex_thread_id=row["codex_thread_id"],
++            codex_turn_id=row["codex_turn_id"], result_text=row["result_text"], error_text=row["error_text"],
++            updated_at=float(row["updated_at"]),
++            delivery_state=row["delivery_state"] if "delivery_state" in row.keys() else "pending",
++            delivery_attempts=int(row["delivery_attempts"] or 0) if "delivery_attempts" in row.keys() else 0,
++            delivery_error=row["delivery_error"] if "delivery_error" in row.keys() else None,
++            delivery_notice_state=row["delivery_notice_state"] if "delivery_notice_state" in row.keys() else None,
++            pending_server_request_id=(row["pending_server_request_id"]
++                                      if "pending_server_request_id" in row.keys() else None),
++            pending_server_request_method=(row["pending_server_request_method"]
++                                           if "pending_server_request_method" in row.keys() else None),
++            pending_server_request_summary=(row["pending_server_request_summary"]
++                                            if "pending_server_request_summary" in row.keys() else None),
++            pending_server_request_expires_at=(float(row["pending_server_request_expires_at"])
++                                               if "pending_server_request_expires_at" in row.keys()
++                                               and row["pending_server_request_expires_at"] is not None else None),
++        )
++
++
++def _json_array(values: tuple[str, ...]) -> str:
++    return json.dumps(list(values), ensure_ascii=False, separators=(",", ":"))
++
++
++def _load_array(value: str) -> list[str]:
++    loaded = json.loads(value)
++    return [str(item) for item in loaded]
++
++
++def _callable_accepts_keyword(callable_obj: Callable[..., Any], name: str) -> bool:
++    """Keep third-party/test executors compatible with the callback extension."""
++    try:
++        parameters = inspect.signature(callable_obj).parameters.values()
++    except (TypeError, ValueError):
++        return True
++    return any(parameter.kind == inspect.Parameter.VAR_KEYWORD or parameter.name == name
++               for parameter in parameters)
++
++
++class TaskExecutor(Protocol):
++    def execute(
++        self, task: TaskRecord, *, on_thread_started: Callable[[str], None] | None = None,
++        on_turn_started: Callable[[str], None] | None = None,
++        on_server_request: Callable[[Any], None] | None = None,
++        on_server_request_settled: Callable[[Any, str], None] | None = None,
++    ) -> ExecutionResult: ...
++
++    def inspect(self, task: TaskRecord) -> ExecutionResult | None: ...
++
++
++class CodexAppServerExecutor:
++    """Run one request through a separate, persistent Codex app-server thread."""
++
++    def __init__(
++        self,
++        *,
++        cwd: str,
++        codex_bin: str = "codex",
++        codex_home: str | None = None,
++        turn_timeout: float = 600.0,
++        session_factory: Callable[..., Any] | None = None,
++        client_capabilities: Mapping[str, Any] | None = None,
++    ) -> None:
++        self.cwd = cwd
++        self.codex_bin = codex_bin
++        self.codex_home = codex_home
++        self.turn_timeout = turn_timeout
++        self._session_factory = session_factory
++        self.client_capabilities = dict(client_capabilities or {"mcpServerOpenaiFormElicitation": True})
++        self._sessions: dict[str, Any] = {}
++        self._sessions_lock = threading.RLock()
++
++    def _new_session(self) -> Any:
++        factory = self._session_factory
++        if factory is None:
++            from agent.transports.codex_app_server_session import CodexAppServerSession
++
++            factory = CodexAppServerSession
++        kwargs = {
++            "cwd": self.cwd, "codex_bin": self.codex_bin, "codex_home": self.codex_home,
++            "client_capabilities": self.client_capabilities,
++        }
++        try:
++            return factory(**kwargs)
++        except TypeError as exc:
++            # Keep small test/fallback session factories compatible with the
++            # pre-capability constructor while the real session opts into the
++            # OpenAI form elicitation capability.
++            if "client_capabilities" not in str(exc):
++                raise
++            kwargs.pop("client_capabilities")
++            return factory(**kwargs)
++
++    def execute(
++        self, task: TaskRecord, *, on_thread_started: Callable[[str], None] | None = None,
++        on_turn_started: Callable[[str], None] | None = None,
++        on_server_request: Callable[[Any], None] | None = None,
++        on_server_request_settled: Callable[[Any, str], None] | None = None,
++    ) -> ExecutionResult:
++        session = self._new_session()
++        with self._sessions_lock:
++            self._sessions[task.request.request_id] = session
++        try:
++            thread_id = session.ensure_started()
++            if on_thread_started is not None:
++                on_thread_started(thread_id)
++            turn = session.run_turn(
++                render_codex_prompt(task.request), turn_timeout=self.turn_timeout,
++                on_turn_started=on_turn_started,
++                on_server_request=on_server_request,
++                on_server_request_settled=on_server_request_settled,
++                allow_pending_server_requests=True,
++            )
++            thread_id = turn.thread_id or thread_id
++            if getattr(turn, "waiting_for_user", False):
++                detail = getattr(turn, "server_request_summary", None)
++                return ExecutionResult(
++                    state=TaskState.WAITING_FOR_USER, codex_thread_id=thread_id,
++                    codex_turn_id=turn.turn_id, result_text=turn.final_text or None,
++                    error_text=turn.error or detail or "Codex requires user confirmation before continuing",
++                )
++            if turn.error:
++                if turn.interrupted and not turn.should_retire:
++                    state = TaskState.CANCELLED
++                elif turn.should_retire or _looks_transport_uncertain(turn.error):
++                    state = TaskState.UNKNOWN
++                else:
++                    state = TaskState.FAILED
++                return ExecutionResult(
++                    state=state, codex_thread_id=thread_id, codex_turn_id=turn.turn_id,
++                    result_text=turn.final_text or None, error_text=turn.error,
++                )
++            return ExecutionResult(
++                state=TaskState.SUCCEEDED, codex_thread_id=thread_id, codex_turn_id=turn.turn_id,
++                result_text=turn.final_text,
++            )
++        except (BrokenPipeError, ConnectionError, OSError, TimeoutError) as exc:
++            return ExecutionResult(state=TaskState.UNKNOWN, error_text=str(exc))
++        except Exception as exc:  # The settlement is unknown if the executor boundary failed unexpectedly.
++            logger.exception("Codex app-server task executor failed")
++            return ExecutionResult(state=TaskState.UNKNOWN, error_text=str(exc))
++        finally:
++            with self._sessions_lock:
++                self._sessions.pop(task.request.request_id, None)
++            try:
++                session.close()
++            except Exception:
++                logger.debug("failed to close Codex app-server session", exc_info=True)
++
++    def pending(self, request_id: str) -> Any | None:
++        """Return the live session's pending request, if the task is still running."""
++        with self._sessions_lock:
++            session = self._sessions.get(request_id)
++        if session is None:
++            return None
++        try:
++            return session.pending_server_request()
++        except Exception:
++            logger.debug("could not inspect pending Codex request", exc_info=True)
++            return None
++
++    def answer(
++        self, request_id: str, server_request_id: str, response: Mapping[str, Any], *,
++        before_release: Callable[[], None] | None = None,
++    ) -> Any:
++        """Answer one live request without starting a second Codex turn."""
++        with self._sessions_lock:
++            session = self._sessions.get(request_id)
++        if session is None:
++            from agent.transports.codex_app_server_session import ServerRequestAnswerResult
++
++            return ServerRequestAnswerResult(False, "not_live", "No live Codex app-server session exists for this task")
++        return session.answer_server_request(server_request_id, response, before_release=before_release)
++
++    def close(self) -> None:
++        """Wake and close live sessions before a gateway worker pool shuts down."""
++        with self._sessions_lock:
++            sessions = list(self._sessions.values())
++        for session in sessions:
++            try:
++                session.close()
++            except Exception:
++                logger.debug("failed to close live Codex task session", exc_info=True)
++
++    def inspect(self, task: TaskRecord) -> ExecutionResult | None:
++        """Read persisted Codex state without starting a new turn or retrying work."""
++
++        if not task.codex_thread_id:
++            return None
++        from agent.transports.codex_app_server import CodexAppServerClient
++
++        client = CodexAppServerClient(codex_bin=self.codex_bin, codex_home=self.codex_home)
++        try:
++            client.initialize(client_name="hermes-task-reconciler", client_title="Hermes Task Reconciler", client_version="0.1")
++            payload = client.request(
++                "thread/read", {"threadId": task.codex_thread_id, "includeTurns": True}, timeout=20
++            )
++            return _execution_result_from_thread_read(payload, task.codex_turn_id)
++        except (BrokenPipeError, ConnectionError, OSError, TimeoutError) as exc:
++            return ExecutionResult(state=TaskState.UNKNOWN, codex_thread_id=task.codex_thread_id, error_text=str(exc))
++        except Exception as exc:
++            logger.exception("Codex app-server task reconciliation failed")
++            return ExecutionResult(state=TaskState.UNKNOWN, codex_thread_id=task.codex_thread_id, error_text=str(exc))
++        finally:
++            client.close()
++
++
++def _looks_transport_uncertain(error: str) -> bool:
++    haystack = error.lower()
++    return any(
++        marker in haystack
++        for marker in (
++            "timed out", "timeout", "subprocess exited", "broken pipe", "connection",
++            "stdin closed", "app-server startup failed",
++        )
++    )
++
++
++def _execution_result_from_thread_read(payload: Mapping[str, Any], turn_id: str | None) -> ExecutionResult:
++    thread = payload.get("thread") or {}
++    thread_id = thread.get("id")
++    status = thread.get("status") or {}
++    active_flags = set(status.get("activeFlags") or []) if isinstance(status, Mapping) else set()
++    if status.get("type") == "active" and active_flags.intersection(
++        {"waitingOnApproval", "waitingOnUser", "waitingOnInput"}
++    ):
++        return ExecutionResult(
++            state=TaskState.WAITING_FOR_USER, codex_thread_id=thread_id, codex_turn_id=turn_id,
++            error_text="Codex task is waiting for user confirmation or input",
++        )
++
++    turns = [turn for turn in (thread.get("turns") or []) if isinstance(turn, Mapping)]
++    if turn_id:
++        selected = next((turn for turn in turns if turn.get("id") == turn_id), None)
++        if selected is None:
++            return ExecutionResult(
++                state=TaskState.UNKNOWN, codex_thread_id=thread_id, codex_turn_id=turn_id,
++                error_text="Persisted Codex turn id was not present in thread/read; manual review required",
++            )
++    else:
++        selected = turns[-1] if turns else None
++    if selected is None:
++        if status.get("type") == "active":
++            return ExecutionResult(state=TaskState.RUNNING, codex_thread_id=thread_id, codex_turn_id=turn_id)
++        return None
++    selected_id = selected.get("id") or turn_id
++    items = selected.get("items") or []
++    result_text = next(
++        (item.get("text") for item in reversed(items) if isinstance(item, Mapping) and item.get("type") == "agentMessage"),
++        None,
++    )
++    turn_status = str(selected.get("status") or "").lower()
++    if turn_status in {"completed", "complete", "succeeded"}:
++        return ExecutionResult(
++            state=TaskState.SUCCEEDED, codex_thread_id=thread_id, codex_turn_id=selected_id,
++            result_text=result_text,
++        )
++    if turn_status in {"interrupted", "cancelled", "canceled"}:
++        return ExecutionResult(
++            state=TaskState.CANCELLED, codex_thread_id=thread_id, codex_turn_id=selected_id,
++            result_text=result_text,
++        )
++    if turn_status in {"failed", "error"} or selected.get("error"):
++        error = selected.get("error")
++        return ExecutionResult(
++            state=TaskState.FAILED, codex_thread_id=thread_id, codex_turn_id=selected_id,
++            result_text=result_text, error_text=str(error) if error else "Codex turn failed",
++        )
++    return ExecutionResult(state=TaskState.RUNNING, codex_thread_id=thread_id, codex_turn_id=selected_id)
++
++
++class CodexTaskBridge:
++    """Durable admission and asynchronous settlement for Codex app tasks."""
++
++    def __init__(
++        self,
++        store: CodexTaskStore,
++        executor: TaskExecutor,
++        *,
++        max_workers: int = 1,
++        pool: ThreadPoolExecutor | None = None,
++        on_settle: Callable[..., bool] | None = None,
++        notification_renderer: Callable[[TaskRecord], str] | None = None,
++        reconcile_attempts: int = 3,
++        reconcile_delay: float = 2.0,
++    ) -> None:
++        self.store = store
++        self.executor = executor
++        self._pool = pool or ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="hermes-codex-task")
++        self._owns_pool = pool is None
++        self._futures: dict[str, Future[Any]] = {}
++        self._lock = threading.Lock()
++        self._on_settle = on_settle
++        self._notification_renderer = notification_renderer
++        self._notification_injected_this_process: set[str] = set()
++        self._reconcile_attempts = max(1, int(reconcile_attempts))
++        self._reconcile_delay = max(0.0, float(reconcile_delay))
++
++    def accept(self, request: TaskRequest) -> tuple[TaskRecord, bool]:
++        record, created = self.store.register(request)
++        if created:
++            self._schedule(request.request_id, self._run)
++        return record, created
++
++    def recover(self) -> None:
++        """Recover queued work and reconcile interrupted work without resubmitting it."""
++
++        for record in self.store.recoverable():
++            if record.state == TaskState.QUEUED:
++                self._schedule(record.request.request_id, self._run)
++            elif record.state == TaskState.WAITING_FOR_USER and record.pending_server_request_id:
++                # The app-server session is a live in-process RPC.  After a
++                # gateway restart it no longer exists, so an old Discord
++                # answer must never be applied to a newly-created turn.
++                settled = self.store.transition(
++                    record.request.request_id, TaskState.UNKNOWN,
++                    error_text=(
++                        f"Pending Codex server request {record.pending_server_request_id} expired when the "
++                        "Hermes gateway restarted; the original app-server session is gone and the task "
++                        "was not replayed. Manual review required."
++                    ),
++                    pending_server_request_id=None, pending_server_request_method=None,
++                    pending_server_request_summary=None, pending_server_request_expires_at=None,
++                )
++                self._notify_settlement(settled)
++            elif record.codex_thread_id:
++                self._schedule(record.request.request_id, self._reconcile)
++            else:
++                # There is no safe Codex identity to inspect or retry.  Never
++                # duplicate a request whose process died before persistence.
++                settled = self.store.transition(
++                    record.request.request_id, TaskState.UNKNOWN,
++                    error_text="Task interrupted before Codex thread id was persisted; manual review required",
++                )
++                self._notify_settlement(settled)
++        self._recover_notifications()
++
++    def future(self, request_id: str) -> Future[Any] | None:
++        with self._lock:
++            return self._futures.get(request_id)
++
++    def reconcile(self, request_id: str) -> TaskRecord:
++        """Refresh an existing Codex task by read-only lookup; never re-submit it."""
++
++        record = self.store.get(request_id)
++        outcome = self._inspect_until_settled(record)
++        if outcome is None:
++            return record
++        return self._settle(request_id, outcome)
++
++    def close(self, *, wait: bool = True) -> None:
++        close_executor = getattr(self.executor, "close", None)
++        if callable(close_executor):
++            try:
++                close_executor()
++            except Exception:
++                logger.debug("failed to close live Codex task sessions", exc_info=True)
++        if self._owns_pool:
++            self._pool.shutdown(wait=wait, cancel_futures=True)
++
++    def _run(self, request_id: str) -> TaskRecord:
++        record = self.store.get(request_id)
++        try:
++            self.store.transition(request_id, TaskState.RUNNING)
++            callbacks: dict[str, Callable[..., None]] = {
++                "on_thread_started": lambda thread_id: self.store.transition(
++                    request_id, TaskState.RUNNING, codex_thread_id=thread_id
++                ),
++                "on_turn_started": lambda turn_id: self.store.transition(
++                    request_id, TaskState.RUNNING, codex_turn_id=turn_id
++                ),
++                "on_server_request": lambda pending: self._mark_server_request(request_id, pending),
++                "on_server_request_settled": lambda pending, reason: self._mark_server_request_settled(
++                    request_id, pending, reason
++                ),
++            }
++            execute_kwargs = {
++                name: callback for name, callback in callbacks.items()
++                if _callable_accepts_keyword(self.executor.execute, name)
++            }
++            outcome = self.executor.execute(record, **execute_kwargs)
++        except Exception as exc:
++            logger.exception("Codex task settlement failed")
++            outcome = ExecutionResult(state=TaskState.UNKNOWN, error_text=str(exc))
++        return self._settle(request_id, outcome)
++
++    def _reconcile(self, request_id: str) -> TaskRecord:
++        record = self.store.get(request_id)
++        outcome = self._inspect_until_settled(record)
++        if outcome is None:
++            return record
++        return self._settle(request_id, outcome)
++
++    def _inspect_until_settled(self, record: TaskRecord) -> ExecutionResult | None:
++        """Bounded startup polling for a still-active Codex thread.
++
++        ``thread/read`` is read-only.  A few short rechecks cover a turn that
++        is completing while Hermes restarts without turning recovery into an
++        unbounded background waiter; an explicitly running task remains
++        recoverable for the next status/restart pass.
++        """
++
++        current = record
++        for attempt in range(self._reconcile_attempts):
++            outcome = self.executor.inspect(current)
++            if outcome is None or outcome.state != TaskState.RUNNING or attempt + 1 >= self._reconcile_attempts:
++                return outcome
++            if self._reconcile_delay:
++                time.sleep(self._reconcile_delay)
++            current = self.store.get(record.request.request_id)
++            if current.state not in {
++                TaskState.RUNNING, TaskState.WAITING_FOR_USER, TaskState.UNKNOWN,
++            }:
++                return None
++        return outcome
++
++    def _schedule(self, request_id: str, worker: Callable[[str], TaskRecord]) -> None:
++        with self._lock:
++            current = self._futures.get(request_id)
++            if current is not None and not current.done():
++                return
++            self._futures[request_id] = self._pool.submit(worker, request_id)
++
++    def _settle(self, request_id: str, outcome: ExecutionResult) -> TaskRecord:
++        clear_error = outcome.state in {TaskState.SUCCEEDED, TaskState.CANCELLED}
++        settled = self.store.transition(
++            request_id,
++            outcome.state,
++            codex_thread_id=outcome.codex_thread_id if outcome.codex_thread_id is not None else _UNSET,
++            codex_turn_id=outcome.codex_turn_id if outcome.codex_turn_id is not None else _UNSET,
++            result_text=outcome.result_text if outcome.result_text is not None else _UNSET,
++            error_text=(
++                outcome.error_text
++                if outcome.error_text is not None
++                else None
++                if clear_error
++                else _UNSET
++            ),
++            pending_server_request_id=None,
++            pending_server_request_method=None,
++            pending_server_request_summary=None,
++            pending_server_request_expires_at=None,
++        )
++        self._notify_settlement(settled)
++        # Delivery bookkeeping is a second durable write; return the current
++        # record so callers can observe its accepted/pending state.
++        return self.store.get(request_id)
++
++    def _notify_settlement(self, record: TaskRecord, *, force: bool = False) -> None:
++        """Attempt one versioned notification; the common delivery ledger owns replay."""
++
++        if self._on_settle is None or record.state not in {
++            TaskState.WAITING_FOR_USER, TaskState.SUCCEEDED, TaskState.FAILED,
++            TaskState.CANCELLED, TaskState.UNKNOWN,
++        }:
++            return
++        notification = None
++        if self._notification_renderer is not None:
++            try:
++                notification = self.store.ensure_notification(
++                    record, self._notification_renderer(record),
++                )
++                if notification.status == "delivered" or notification.delivery_obligation_id:
++                    return
++                if not force and notification.status == "injected":
++                    return
++                notification = self.store.mark_notification_attempt(notification.notification_id, force=force)
++            except Exception:
++                logger.exception("Could not prepare Codex notification for %s", record.request.request_id)
++                return
++        elif not force and (
++            record.delivery_state in {"accepted", "delivered"}
++            and record.delivery_notice_state == record.state.value
++        ):
++            return
++        try:
++            attempted = self.store.mark_delivery_attempt(record.request.request_id)
++            if notification is not None and _callable_accepts_keyword(self._on_settle, "notification"):
++                accepted = bool(self._on_settle(attempted, notification=notification))
++            else:
++                accepted = bool(self._on_settle(attempted))
++            if accepted:
++                if notification is not None:
++                    self.store.mark_notification_injected(
++                        notification.notification_id,
++                        expected_state=notification.expected_state,
++                        generation=notification.generation,
++                    )
++                    self._notification_injected_this_process.add(notification.notification_id)
++                # Retain the old task-level field for diagnostics and migration
++                # visibility; it is deliberately not used for recovery anymore.
++                self.store.mark_delivery_accepted(record.request.request_id, attempted.state)
++            else:
++                if notification is not None:
++                    self.store.mark_notification_failed(
++                        notification.notification_id,
++                        "Gateway injection was not accepted; delivery remains pending",
++                    )
++                self.store.mark_delivery_failed(
++                    record.request.request_id,
++                    "Gateway injection was not accepted; delivery remains pending",
++                )
++        except Exception as exc:  # Delivery failure must not change Codex settlement.
++            logger.exception("Codex task completion delivery failed")
++            if notification is not None:
++                try:
++                    self.store.mark_notification_failed(notification.notification_id, str(exc))
++                except Exception:
++                    logger.debug("could not persist Codex notification failure", exc_info=True)
++            try:
++                self.store.mark_delivery_failed(record.request.request_id, str(exc))
++            except Exception:
++                logger.debug("could not persist Codex task delivery failure", exc_info=True)
++
++    def _recover_notifications(self) -> None:
++        """Recover only notifications without a common delivery-ledger obligation.
++
++        The shared ledger is the sole owner once a final send has been
++        ledgered.  Pre-existing task rows have no notification row and are
++        intentionally left as legacy/unconfirmed rather than replayed.
++        """
++        if self._notification_renderer is None or self._on_settle is None:
++            return
++        for notification in self.store.unresolved_notifications():
++            if notification.notification_id in self._notification_injected_this_process:
++                continue
++            try:
++                record = self.store.get(notification.task_id)
++            except KeyError:
++                continue
++            linked = notification.delivery_obligation_id
++            if linked is None:
++                try:
++                    from gateway.delivery_ledger import find_obligation_for_notification, get_obligation
++
++                    row = find_obligation_for_notification(notification.notification_id)
++                    if row is not None:
++                        linked = str(row["obligation_id"])
++                        self.store.link_notification_obligation(
++                            notification.notification_id,
++                            expected_state=notification.expected_state,
++                            generation=notification.generation,
++                            obligation_id=linked,
++                        )
++                except Exception:
++                    logger.debug("Could not reconcile Codex notification with delivery ledger", exc_info=True)
++            if linked:
++                try:
++                    from gateway.delivery_ledger import get_obligation
++
++                    row = get_obligation(linked)
++                    if row is not None and row["state"] == "delivered":
++                        self.store.mark_notification_delivered(
++                            notification.notification_id,
++                            expected_state=notification.expected_state,
++                            generation=notification.generation,
++                            message_id=row.get("message_id"),
++                            continuation_message_ids=tuple(row.get("continuation_message_ids") or ()),
++                        )
++                except Exception:
++                    logger.debug("Could not reconcile delivered Codex notification %s", linked, exc_info=True)
++                continue
++            current_server_request_id = (
++                str(record.pending_server_request_id)
++                if record.state == TaskState.WAITING_FOR_USER and record.pending_server_request_id
++                else None
++            )
++            is_current_version = (
++                notification.expected_state == record.state
++                and notification.server_request_id == current_server_request_id
++            )
++            if not is_current_version:
++                self.store.mark_notification_superseded(
++                    notification.notification_id,
++                    f"Superseded by current task state {record.state.value}",
++                )
++                continue
++            self._notify_notification(record, notification, force=True)
++
++    def _notify_notification(
++        self, record: TaskRecord, notification: TaskNotification, *, force: bool = False,
++    ) -> None:
++        if self._on_settle is None or notification.status == "delivered":
++            return
++        if notification.delivery_obligation_id:
++            return
++        try:
++            attempted = self.store.mark_notification_attempt(notification.notification_id, force=force)
++            if _callable_accepts_keyword(self._on_settle, "notification"):
++                accepted = bool(self._on_settle(record, notification=attempted))
++            else:
++                accepted = bool(self._on_settle(record))
++            if accepted:
++                self.store.mark_notification_injected(
++                    attempted.notification_id,
++                    expected_state=attempted.expected_state,
++                    generation=attempted.generation,
++                )
++                self._notification_injected_this_process.add(attempted.notification_id)
++            else:
++                self.store.mark_notification_failed(
++                    attempted.notification_id,
++                    "Gateway injection was not accepted; delivery remains pending",
++                )
++        except Exception as exc:
++            logger.exception("Codex notification recovery failed for %s", notification.notification_id)
++            try:
++                self.store.mark_notification_failed(notification.notification_id, str(exc))
++            except Exception:
++                logger.debug("could not persist recovered Codex notification failure", exc_info=True)
++
++    def _mark_server_request(self, request_id: str, pending: Any) -> None:
++        """Persist a live server request before the worker waits for Discord."""
++        try:
++            record = self.store.transition(
++                request_id, TaskState.WAITING_FOR_USER,
++                codex_thread_id=getattr(pending, "thread_id", None) or _UNSET,
++                codex_turn_id=getattr(pending, "turn_id", None) or _UNSET,
++                error_text=str(getattr(pending, "summary", "Codex is waiting for owner input")),
++                pending_server_request_id=str(getattr(pending, "request_id", "")),
++                pending_server_request_method=str(getattr(pending, "method", "")),
++                pending_server_request_summary=str(getattr(pending, "summary", "")),
++                pending_server_request_expires_at=getattr(pending, "expires_at", None),
++            )
++        except Exception:
++            logger.exception("failed to persist pending Codex server request for %s", request_id)
++            raise
++        self._notify_settlement(record)
++
++    def _mark_server_request_settled(self, request_id: str, pending: Any, reason: str) -> None:
++        """Clear durable pending identity on timeout/cleanup/disconnect."""
++        try:
++            current = self.store.get(request_id)
++            if current.pending_server_request_id != str(getattr(pending, "request_id", "")):
++                return
++            if reason in {"timeout", "auto_timeout"}:
++                self.store.transition(
++                    request_id, TaskState.RUNNING, error_text=None,
++                    pending_server_request_id=None, pending_server_request_method=None,
++                    pending_server_request_summary=None, pending_server_request_expires_at=None,
++                )
++            else:
++                # Leave the state for _settle() to classify the turn outcome;
++                # only remove the stale request binding now.
++                self.store.transition(
++                    request_id, current.state,
++                    pending_server_request_id=None, pending_server_request_method=None,
++                    pending_server_request_summary=None, pending_server_request_expires_at=None,
++                )
++        except Exception:
++            logger.exception("failed to clear pending Codex server request for %s", request_id)
++
++    def answer(
++        self, task_id: str, server_request_id: str, response: Mapping[str, Any], *, origin: DiscordOrigin,
++    ) -> TaskAnswerResult:
++        """Answer a request after binding task, request, and authenticated origin."""
++        try:
++            record = self.store.get(task_id)
++        except KeyError:
++            return TaskAnswerResult(False, "not_found", "No Codex task exists for that task id")
++        if not _same_origin(record.request.origin, origin):
++            return TaskAnswerResult(False, "forbidden", "That Codex task is not owned by this Discord DM")
++        if record.state != TaskState.WAITING_FOR_USER or not record.pending_server_request_id:
++            return TaskAnswerResult(False, "stale", "That Codex task has no live pending server request")
++        if str(server_request_id) != record.pending_server_request_id:
++            return TaskAnswerResult(False, "mismatch", "The server request id does not match the task's live request")
++        pending = getattr(self.executor, "pending", lambda _request_id: None)(task_id)
++        if pending is None:
++            return TaskAnswerResult(
++                False, "not_live",
++                "The Codex app-server session is no longer live; this request cannot be resumed after a restart",
++            )
++        if str(getattr(pending, "request_id", "")) != record.pending_server_request_id:
++            return TaskAnswerResult(False, "mismatch", "The live Codex request does not match durable task state")
++
++        def before_release() -> None:
++            current = self.store.get(task_id)
++            if current.state != TaskState.WAITING_FOR_USER \
++                    or current.pending_server_request_id != record.pending_server_request_id:
++                raise RuntimeError("Codex task pending request changed before answer was released")
++            self.store.transition(
++                task_id, TaskState.RUNNING, error_text=None,
++                pending_server_request_id=None, pending_server_request_method=None,
++                pending_server_request_summary=None, pending_server_request_expires_at=None,
++            )
++
++        try:
++            outcome = self.executor.answer(
++                task_id, server_request_id, response, before_release=before_release,
++            )
++        except Exception as exc:
++            logger.exception("Codex task answer failed")
++            return TaskAnswerResult(False, "error", f"Could not answer the live Codex request: {type(exc).__name__}")
++        if getattr(outcome, "accepted", False):
++            return TaskAnswerResult(True, "accepted", getattr(outcome, "message", "Codex answer accepted"))
++        return TaskAnswerResult(False, getattr(outcome, "reason", "rejected"), getattr(outcome, "message", "Codex answer rejected"))
++
++    def pending_for_origin(self, origin: DiscordOrigin) -> list[TaskRecord]:
++        return self.store.pending_for_origin(
++            platform=origin.platform, profile=origin.profile,
++            conversation_id=origin.conversation_id, sender_id=origin.sender_id,
++        )
++
++
++def _same_origin(expected: DiscordOrigin, actual: DiscordOrigin) -> bool:
++    return (
++        expected.platform == actual.platform
++        and expected.profile == actual.profile
++        and expected.sender_id == actual.sender_id
++        and expected.conversation_id == actual.conversation_id
++        and expected.conversation_type == actual.conversation_type
++    )
++
++
++def _notification_payload(notification: TaskNotification, *, task_id: str, store_path: str,
++                          session_key: str) -> dict[str, Any]:
++    """Build the internal marker carried from plugin injection to final delivery."""
++    return {
++        "notification_id": notification.notification_id,
++        "task_id": str(task_id),
++        "generation": int(notification.generation),
++        "expected_state": notification.expected_state.value,
++        "store_path": str(store_path),
++        "session_key": str(session_key),
++    }
++
++
++def link_codex_notification_to_obligation(
++    *, store_path: str, notification_id: str, expected_state: str,
++    generation: int, obligation_id: str,
++) -> bool:
++    """Link a common delivery-ledger obligation to one notification version."""
++    try:
++        with CodexTaskStore(store_path) as store:
++            return store.link_notification_obligation(
++                notification_id,
++                expected_state=TaskState(expected_state),
++                generation=int(generation),
++                obligation_id=obligation_id,
++            )
++    except Exception:
++        logger.debug("Could not link Codex notification to delivery obligation", exc_info=True)
++        return False
++
++
++def mark_codex_notification_delivered(
++    *, store_path: str, notification_id: str, expected_state: str, generation: int,
++    message_id: str | None, continuation_message_ids: tuple[str, ...] = (),
++) -> bool:
++    """Record an actual platform send receipt using state/generation CAS."""
++    try:
++        with CodexTaskStore(store_path) as store:
++            return store.mark_notification_delivered(
++                notification_id,
++                expected_state=TaskState(expected_state),
++                generation=int(generation),
++                message_id=message_id,
++                continuation_message_ids=continuation_message_ids,
++            )
++    except Exception:
++        logger.debug("Could not record Codex notification delivery receipt", exc_info=True)
++        return False
++
++
++_LIVE_BRIDGES: dict[tuple[str, str, str], CodexTaskBridge] = {}
++_LIVE_BRIDGES_LOCK = threading.RLock()
++
++
++def register_live_codex_bridge(
++    *, platform: str, profile: str, conversation_id: str, bridge: CodexTaskBridge,
++) -> None:
++    """Publish one profile-scoped bridge for built-in off-turn commands."""
++    with _LIVE_BRIDGES_LOCK:
++        _LIVE_BRIDGES[(platform, profile, conversation_id)] = bridge
++
++
++def unregister_live_codex_bridge(*, platform: str, profile: str, conversation_id: str, bridge: CodexTaskBridge) -> None:
++    with _LIVE_BRIDGES_LOCK:
++        key = (platform, profile, conversation_id)
++        if _LIVE_BRIDGES.get(key) is bridge:
++            _LIVE_BRIDGES.pop(key, None)
++
++
++def _get_live_codex_bridge(*, platform: str, profile: str, conversation_id: str) -> CodexTaskBridge | None:
++    with _LIVE_BRIDGES_LOCK:
++        return _LIVE_BRIDGES.get((platform, profile, conversation_id))
++
++
++def resolve_live_codex_approval(
++    *, origin: DiscordOrigin, raw_args: str, choice: str,
++    prefer_existing_gateway_approval: bool = False,
++) -> tuple[bool, str | None]:
++    """Resolve a command/file approval from the built-in ``/approve``/``/deny`` path.
++
++    The normal no-argument form is allowed only when exactly one Codex request
++    is pending for this authenticated owner DM.  Explicit task/request ids can
++    be used when several approvals coexist and always bind both identities.
++    """
++    bridge = _get_live_codex_bridge(
++        platform=origin.platform, profile=origin.profile or "", conversation_id=origin.conversation_id,
++    )
++    if bridge is None:
++        return False, None
++    try:
++        tokens = shlex.split(raw_args or "")
++    except ValueError:
++        return True, "Could not parse the Codex approval arguments."
++    modifier_tokens = {"once", "session", "always", "permanent", "permanently"}
++    explicit = [token for token in tokens if token.lower() not in modifier_tokens and token.lower() != "all"]
++    if prefer_existing_gateway_approval and len(explicit) < 2:
++        return False, None
++    if tokens and tokens[0].lower() == "all" and len(explicit) == 0:
++        return False, None
++    pending = bridge.pending_for_origin(origin)
++    task_id: str | None = None
++    server_request_id: str | None = None
++    if len(explicit) >= 2:
++        task_id, server_request_id = explicit[0], explicit[1]
++        try:
++            record = bridge.store.get(task_id)
++        except KeyError:
++            return True, "No Codex task exists for that task id."
++        if not _same_origin(record.request.origin, origin):
++            return True, "That Codex task is not owned by this Discord DM."
++        candidates = [record]
++    elif len(explicit) == 1:
++        candidates = [record for record in pending if record.pending_server_request_id == explicit[0]]
++        if not candidates:
++            return True, "No live Codex request matches that server request id."
++        task_id = candidates[0].request.request_id
++        server_request_id = candidates[0].pending_server_request_id
++    else:
++        if not pending:
++            return False, None
++        if len(pending) > 1:
++            return True, "More than one Codex request is pending; provide <task_id> <server_request_id>."
++        candidates = pending
++        task_id = candidates[0].request.request_id
++        server_request_id = candidates[0].pending_server_request_id
++    record = candidates[0]
++    if record.pending_server_request_method not in {
++        "item/commandExecution/requestApproval", "item/fileChange/requestApproval",
++    }:
++        return True, (
++            f"This pending Codex request is {record.pending_server_request_method}; "
++            "use /codex-respond with the exact JSON response for that request type."
++        )
++    decision = "decline"
++    if choice == "approve":
++        lowered = {token.lower() for token in tokens}
++        decision = "acceptForSession" if lowered.intersection({"session", "always", "permanent", "permanently"}) else "accept"
++    result = bridge.answer(
++        task_id or "", server_request_id or "", {"decision": decision}, origin=origin,
++    )
++    return True, result.message
+diff --git a/tests/gateway/test_codex_app_tasks.py b/tests/gateway/test_codex_app_tasks.py
+new file mode 100644
+index 0000000..62619a5
+--- /dev/null
++++ b/tests/gateway/test_codex_app_tasks.py
+@@ -0,0 +1,620 @@
++from __future__ import annotations
++
++import sqlite3
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.codex_app_tasks import (
++    CodexTaskBridge,
++    CodexTaskStore,
++    DiscordOrigin,
++    ExecutionResult,
++    InvalidStateTransition,
++    TaskConflictError,
++    TaskState,
++    _execution_result_from_thread_read,
++    build_task_request,
++    render_codex_prompt,
++    register_live_codex_bridge,
++    resolve_live_codex_approval,
++    unregister_live_codex_bridge,
++)
++
++
++def make_request(*, message_id: str = "m-1", plan_extra: dict | None = None, profile: str | None = None):
++    origin = DiscordOrigin(
++        sender_id="owner-1",
++        conversation_id="dm-1",
++        message_id=message_id,
++        thread_id="thread-1",
++        profile=profile,
++    )
++    plan = {
++        "purpose": "Read a bounded test result",
++        "steps": ["Use the verified connector", "Return the result"],
++        "target_services": ["google-calendar"],
++        "scope": "Read-only test data only",
++        "completion_conditions": ["Return the count"],
++        **(plan_extra or {}),
++    }
++    return build_task_request(origin, plan, request_id=f"req-{message_id}", now=100.0)
++
++
++class FakeExecutor:
++    def __init__(self, outcome: ExecutionResult):
++        self.outcome = outcome
++        self.executed: list[str] = []
++        self.inspected: list[str] = []
++
++    def execute(self, task, *, on_thread_started=None, on_turn_started=None):
++        self.executed.append(task.request.request_id)
++        if on_thread_started:
++            on_thread_started(self.outcome.codex_thread_id or "thread-fake")
++        if on_turn_started and self.outcome.codex_turn_id:
++            on_turn_started(self.outcome.codex_turn_id)
++        return self.outcome
++
++    def inspect(self, task):
++        self.inspected.append(task.request.request_id)
++        return self.outcome
++
++
++class BlockingApprovalExecutor:
++    """Small executor double that exposes the bridge's live answer boundary."""
++
++    def __init__(self):
++        from agent.transports.codex_app_server_session import PendingServerRequest
++
++        self.executed: list[str] = []
++        self.pending_request = PendingServerRequest(
++            request_id="srv-1", method="item/commandExecution/requestApproval",
++            params={"command": "echo approved", "cwd": "/tmp"},
++            summary="Codex requests command approval: echo approved",
++            created_at=time.monotonic(), expires_at=None, thread_id="thr-live", turn_id="turn-live",
++            wire_request_id="srv-1",
++        )
++        self.released = threading.Event()
++
++    def execute(self, task, *, on_thread_started=None, on_turn_started=None,
++                on_server_request=None, on_server_request_settled=None):
++        self.executed.append(task.request.request_id)
++        if on_thread_started:
++            on_thread_started("thr-live")
++        if on_turn_started:
++            on_turn_started("turn-live")
++        if on_server_request:
++            on_server_request(self.pending_request)
++        assert self.released.wait(timeout=2)
++        return ExecutionResult(
++            state=TaskState.SUCCEEDED, codex_thread_id="thr-live", codex_turn_id="turn-live",
++            result_text="approved result",
++        )
++
++    def pending(self, request_id):
++        return self.pending_request if not self.released.is_set() else None
++
++    def answer(self, request_id, server_request_id, response, *, before_release=None):
++        if server_request_id != self.pending_request.request_id:
++            return SimpleNamespace(accepted=False, reason="mismatch", message="mismatch")
++        if response not in ({"decision": "accept"}, {"decision": "acceptForSession"}):
++            return SimpleNamespace(accepted=False, reason="invalid", message="invalid")
++        if before_release:
++            before_release()
++        self.released.set()
++        return SimpleNamespace(accepted=True, reason="accepted", message="Codex answer accepted")
++
++    def inspect(self, task):
++        return None
++
++
++def test_reply_target_is_derived_from_discord_origin(tmp_path):
++    request = build_task_request(
++        DiscordOrigin("sender", "dm-42", "message-42"),
++        {
++            "purpose": "test",
++            "steps": ["one"],
++            "target_services": ["chrome"],
++            "scope": "public page",
++            "completion_conditions": ["title"],
++            "reply_target": {"conversation_id": "attacker-channel"},
++        },
++        request_id="req-42",
++        now=1.0,
++    )
++    assert request.reply_target == {"platform": "discord", "conversation_id": "dm-42", "thread_id": None}
++    rendered = render_codex_prompt(request)
++    assert "attacker-channel" not in rendered
++    assert "dm-42" not in rendered
++    assert "sender" not in rendered
++
++
++def test_duplicate_discord_delivery_is_idempotent(tmp_path):
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        first, created = store.register(make_request())
++        second, created_again = store.register(make_request())
++        assert created is True
++        assert created_again is False
++        assert first.request.request_id == second.request.request_id
++        assert first.state == second.state == TaskState.QUEUED
++
++        with pytest.raises(TaskConflictError):
++            store.register(make_request(plan_extra={"purpose": "different"}))
++
++
++def test_replayed_event_fingerprint_ignores_time_and_generated_request_id(tmp_path):
++    first = make_request()
++    replay = build_task_request(
++        first.origin, first.plan, request_id="a-different-local-id", now=999.0,
++    )
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        stored, created = store.register(first)
++        replayed, replay_created = store.register(replay)
++        assert created is True
++        assert replay_created is False
++        assert replayed.request.request_id == stored.request.request_id
++
++
++def test_store_migrates_pre_replay_fingerprint_on_open(tmp_path):
++    path = tmp_path / "tasks.sqlite"
++    request = make_request()
++    with CodexTaskStore(path) as store:
++        store.register(request)
++        store._conn.execute("UPDATE codex_app_tasks SET fingerprint='old-fingerprint'")  # noqa: SLF001
++        store._conn.commit()
++    replay = build_task_request(request.origin, request.plan, request_id="new-id", now=999.0)
++    with CodexTaskStore(path) as store:
++        _record, created = store.register(replay)
++        assert created is False
++
++
++def test_thread_read_does_not_fallback_to_a_different_turn():
++    outcome = _execution_result_from_thread_read(
++        {"thread": {"id": "thr", "status": {"type": "idle"}, "turns": [
++            {"id": "other-turn", "status": "completed", "items": [{"type": "agentMessage", "text": "wrong"}]},
++        ]}},
++        "persisted-turn",
++    )
++    assert outcome.state == TaskState.UNKNOWN
++    assert outcome.codex_turn_id == "persisted-turn"
++    assert "not present" in (outcome.error_text or "")
++
++
++def test_default_request_id_is_stable_for_replayed_discord_event():
++    origin = DiscordOrigin("sender", "dm-42", "message-42")
++    plan = {
++        "purpose": "test",
++        "steps": ["one"],
++        "target_services": ["chrome"],
++        "scope": "public page",
++        "completion_conditions": ["title"],
++    }
++    first = build_task_request(origin, plan, now=1.0)
++    replay = build_task_request(origin, plan, now=2.0)
++    assert first.request_id == replay.request_id
++
++
++def test_state_transitions_reject_terminal_reexecution(tmp_path):
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        store.register(make_request())
++        store.transition("req-m-1", TaskState.RUNNING)
++        store.transition("req-m-1", TaskState.SUCCEEDED, result_text="ok")
++        with pytest.raises(InvalidStateTransition):
++            store.transition("req-m-1", TaskState.RUNNING)
++
++
++def test_bridge_records_success_and_persists_codex_ids(tmp_path):
++    executor = FakeExecutor(
++        ExecutionResult(
++            state=TaskState.SUCCEEDED,
++            codex_thread_id="thr-1",
++            codex_turn_id="turn-1",
++            result_text="count=0",
++        )
++    )
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        bridge = CodexTaskBridge(store, executor)
++        try:
++            record, created = bridge.accept(make_request())
++            assert created is True
++            bridge.future(record.request.request_id).result(timeout=2)
++            settled = store.get(record.request.request_id)
++            assert settled.state == TaskState.SUCCEEDED
++            assert settled.codex_thread_id == "thr-1"
++            assert settled.codex_turn_id == "turn-1"
++            assert settled.result_text == "count=0"
++            assert executor.executed == [record.request.request_id]
++        finally:
++            bridge.close()
++
++
++def test_bridge_persists_turn_id_as_soon_as_executor_reports_it(tmp_path):
++    executor = FakeExecutor(ExecutionResult(state=TaskState.SUCCEEDED, codex_thread_id="thr-1", codex_turn_id="turn-1"))
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        bridge = CodexTaskBridge(store, executor)
++        try:
++            record, _ = bridge.accept(make_request())
++            bridge.future(record.request.request_id).result(timeout=2)
++            assert store.get(record.request.request_id).codex_turn_id == "turn-1"
++        finally:
++            bridge.close()
++
++
++def test_bridge_answers_live_request_once_and_resumes_same_execution(tmp_path):
++    executor = BlockingApprovalExecutor()
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        bridge = CodexTaskBridge(store, executor, on_settle=lambda _record: True)
++        try:
++            request = make_request()
++            record, _ = bridge.accept(request)
++            deadline = time.time() + 1.0
++            while store.get(record.request.request_id).state != TaskState.WAITING_FOR_USER and time.time() < deadline:
++                time.sleep(0.005)
++            waiting = store.get(record.request.request_id)
++            assert waiting.state == TaskState.WAITING_FOR_USER
++            assert waiting.pending_server_request_id == "srv-1"
++            assert waiting.pending_server_request_method == "item/commandExecution/requestApproval"
++            wrong_origin = DiscordOrigin("other", "dm-1", "m-answer", thread_id="thread-1")
++            denied = bridge.answer(
++                record.request.request_id, "srv-1", {"decision": "accept"}, origin=wrong_origin,
++            )
++            assert denied.status == "forbidden"
++            accepted = bridge.answer(
++                record.request.request_id, "srv-1", {"decision": "accept"}, origin=request.origin,
++            )
++            assert accepted.accepted is True
++            duplicate = bridge.answer(
++                record.request.request_id, "srv-1", {"decision": "accept"}, origin=request.origin,
++            )
++            assert duplicate.status in {"stale", "not_live", "duplicate"}
++            bridge.future(record.request.request_id).result(timeout=2)
++            settled = store.get(record.request.request_id)
++            assert settled.state == TaskState.SUCCEEDED
++            assert settled.pending_server_request_id is None
++            assert executor.executed == [record.request.request_id]
++        finally:
++            bridge.close()
++
++
++def test_existing_approve_entrypoint_binds_owner_and_both_request_ids(tmp_path):
++    executor = BlockingApprovalExecutor()
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        bridge = CodexTaskBridge(store, executor)
++        origin = make_request(profile="ownerreview").origin
++        register_live_codex_bridge(
++            platform="discord", profile="ownerreview", conversation_id=origin.conversation_id, bridge=bridge,
++        )
++        try:
++            request = make_request(message_id="m-approval", profile="ownerreview")
++            record, _ = bridge.accept(request)
++            deadline = time.time() + 1.0
++            while store.get(record.request.request_id).state != TaskState.WAITING_FOR_USER and time.time() < deadline:
++                time.sleep(0.005)
++            handled, reply = resolve_live_codex_approval(
++                origin=DiscordOrigin("other", origin.conversation_id, "answer-1", profile="ownerreview"),
++                raw_args=f"{record.request.request_id} srv-1 session", choice="approve",
++            )
++            assert handled is True
++            assert "not owned" in (reply or "")
++            handled, reply = resolve_live_codex_approval(
++                origin=DiscordOrigin(origin.sender_id, origin.conversation_id, "answer-2", profile="ownerreview"),
++                raw_args=f"{record.request.request_id} srv-1 session", choice="approve",
++            )
++            assert handled is True
++            assert "accepted" in (reply or "")
++            bridge.future(record.request.request_id).result(timeout=2)
++            assert store.get(record.request.request_id).state == TaskState.SUCCEEDED
++        finally:
++            unregister_live_codex_bridge(
++                platform="discord", profile="ownerreview", conversation_id=origin.conversation_id, bridge=bridge,
++            )
++            bridge.close()
++
++
++def test_recovery_expires_persisted_pending_request_without_resubmitting(tmp_path):
++    path = tmp_path / "tasks.sqlite"
++    request = make_request()
++    with CodexTaskStore(path) as store:
++        store.register(request)
++        store.transition(request.request_id, TaskState.RUNNING)
++        store.transition(
++            request.request_id, TaskState.WAITING_FOR_USER,
++            codex_thread_id="thr-live", codex_turn_id="turn-live", error_text="approval",
++            pending_server_request_id="srv-1",
++            pending_server_request_method="item/commandExecution/requestApproval",
++            pending_server_request_summary="approval",
++        )
++    executor = FakeExecutor(ExecutionResult(state=TaskState.SUCCEEDED, codex_thread_id="thr-live"))
++    with CodexTaskStore(path) as store:
++        bridge = CodexTaskBridge(store, executor)
++        try:
++            bridge.recover()
++            recovered = store.get(request.request_id)
++            assert recovered.state == TaskState.UNKNOWN
++            assert recovered.pending_server_request_id is None
++            assert "gateway restarted" in (recovered.error_text or "")
++            assert executor.executed == []
++            assert executor.inspected == []
++        finally:
++            bridge.close()
++
++
++def test_queued_task_is_recovered_after_restart_without_duplicate_registration(tmp_path):
++    path = tmp_path / "tasks.sqlite"
++    with CodexTaskStore(path) as store:
++        request = make_request()
++        store.register(request)
++    executor = FakeExecutor(ExecutionResult(state=TaskState.SUCCEEDED, codex_thread_id="thr-r"))
++    with CodexTaskStore(path) as store:
++        bridge = CodexTaskBridge(store, executor)
++        try:
++            bridge.recover()
++            bridge.future(request.request_id).result(timeout=2)
++            assert store.get(request.request_id).state == TaskState.SUCCEEDED
++            assert executor.executed == [request.request_id]
++        finally:
++            bridge.close()
++
++
++def test_completion_acceptance_is_tracked_per_task_state_and_not_claimed_as_delivery(tmp_path):
++    notices: list[TaskState] = []
++    executor = FakeExecutor(ExecutionResult(state=TaskState.WAITING_FOR_USER, error_text="approval"))
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        bridge = CodexTaskBridge(store, executor, on_settle=lambda record: notices.append(record.state) or True)
++        try:
++            record, _ = bridge.accept(make_request())
++            bridge.future(record.request.request_id).result(timeout=2)
++            waiting = store.get(record.request.request_id)
++            assert waiting.delivery_state == "accepted"
++            assert waiting.delivery_notice_state == TaskState.WAITING_FOR_USER.value
++            assert notices == [TaskState.WAITING_FOR_USER]
++            succeeded = bridge._settle(  # noqa: SLF001 - exercise the durable settlement boundary
++                record.request.request_id,
++                ExecutionResult(state=TaskState.SUCCEEDED, result_text="done"),
++            )
++            assert succeeded.delivery_notice_state == TaskState.SUCCEEDED.value
++            assert notices == [TaskState.WAITING_FOR_USER, TaskState.SUCCEEDED]
++        finally:
++            bridge.close()
++
++
++def test_notification_versions_are_per_rpc_and_delivery_ack_uses_cas(tmp_path):
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        request = make_request()
++        store.register(request)
++        store.transition(request.request_id, TaskState.RUNNING)
++        store.transition(
++            request.request_id, TaskState.WAITING_FOR_USER,
++            pending_server_request_id="srv-1", pending_server_request_method="mcpServer/elicitation/request",
++            pending_server_request_summary="first prompt",
++        )
++        waiting_one = store.get(request.request_id)
++        first = store.ensure_notification(waiting_one, "first prompt")
++
++        store.transition(
++            request.request_id, TaskState.RUNNING,
++            pending_server_request_id=None, pending_server_request_method=None,
++            pending_server_request_summary=None,
++        )
++        store.transition(
++            request.request_id, TaskState.WAITING_FOR_USER,
++            pending_server_request_id="srv-2", pending_server_request_method="mcpServer/elicitation/request",
++            pending_server_request_summary="second prompt",
++        )
++        second = store.ensure_notification(store.get(request.request_id), "second prompt")
++        assert first.notification_id != second.notification_id
++        assert first.generation < second.generation
++        assert first.server_request_id == "srv-1"
++        assert second.server_request_id == "srv-2"
++
++        assert store.mark_notification_delivered(
++            first.notification_id, expected_state=TaskState.WAITING_FOR_USER,
++            generation=first.generation, message_id="discord-wait-1",
++        ) is True
++        assert store.notification(first.notification_id).status == "delivered"
++        assert store.notification(second.notification_id).status == "pending"
++
++        store.transition(
++            request.request_id, TaskState.SUCCEEDED,
++            result_text="done", pending_server_request_id=None,
++            pending_server_request_method=None, pending_server_request_summary=None,
++        )
++        succeeded = store.ensure_notification(store.get(request.request_id), "done")
++        assert succeeded.generation > second.generation
++        # A stale ACK cannot cross the notification identity or state version.
++        assert store.mark_notification_delivered(
++            succeeded.notification_id, expected_state=TaskState.WAITING_FOR_USER,
++            generation=second.generation, message_id="stale",
++        ) is False
++        assert store.notification(succeeded.notification_id).status == "pending"
++
++
++def test_restart_replays_only_current_notification_version(tmp_path):
++    calls: list[str] = []
++    path = tmp_path / "tasks.sqlite"
++    request = make_request()
++    with CodexTaskStore(path) as store:
++        store.register(request)
++        store.transition(request.request_id, TaskState.RUNNING)
++        waiting_record = store.transition(
++            request.request_id, TaskState.WAITING_FOR_USER,
++            pending_server_request_id="srv-old",
++        )
++        waiting = store.ensure_notification(waiting_record, "old prompt")
++        store.mark_notification_injected(
++            waiting.notification_id, expected_state=TaskState.WAITING_FOR_USER,
++            generation=waiting.generation,
++        )
++        store.transition(
++            request.request_id, TaskState.RUNNING,
++            pending_server_request_id=None,
++        )
++        succeeded_record = store.transition(
++            request.request_id, TaskState.SUCCEEDED, result_text="done",
++        )
++        succeeded = store.ensure_notification(succeeded_record, "done")
++
++    with CodexTaskStore(path) as store:
++        bridge = CodexTaskBridge(
++            store, FakeExecutor(ExecutionResult(state=TaskState.SUCCEEDED)),
++            on_settle=lambda _record, notification=None: calls.append(notification.notification_id) or True,
++            notification_renderer=lambda record: "done" if record.state == TaskState.SUCCEEDED else "other",
++        )
++        try:
++            bridge.recover()
++            assert calls == [succeeded.notification_id]
++            assert store.notification(waiting.notification_id).status == "superseded"
++        finally:
++            bridge.close()
++
++
++def test_restart_does_not_mass_reinject_legacy_accepted_task_rows(tmp_path):
++    calls: list[str] = []
++    path = tmp_path / "tasks.sqlite"
++    request = make_request(message_id="legacy")
++    with CodexTaskStore(path) as store:
++        store.register(request)
++        store.transition(request.request_id, TaskState.RUNNING)
++        store.transition(request.request_id, TaskState.SUCCEEDED, result_text="done")
++        store.mark_delivery_accepted(request.request_id, TaskState.SUCCEEDED)
++
++    with CodexTaskStore(path) as store:
++        bridge = CodexTaskBridge(
++            store, FakeExecutor(ExecutionResult(state=TaskState.SUCCEEDED)),
++            on_settle=lambda _record, **_kw: calls.append("legacy") or True,
++            notification_renderer=lambda _record: "done",
++        )
++        try:
++            bridge.recover()
++            assert calls == []
++            assert store.unresolved_notifications() == []
++        finally:
++            bridge.close()
++
++
++def test_restart_recovery_does_not_reinject_a_notification_linked_to_common_ledger(tmp_path):
++    calls: list[str] = []
++    path = tmp_path / "tasks.sqlite"
++    request = make_request()
++    with CodexTaskStore(path) as store:
++        store.register(request)
++        store.transition(request.request_id, TaskState.RUNNING)
++        store.transition(request.request_id, TaskState.SUCCEEDED, result_text="done")
++        record = store.get(request.request_id)
++        notification = store.ensure_notification(record, "done")
++        store.mark_notification_attempt(notification.notification_id)
++        store.mark_notification_injected(
++            notification.notification_id, expected_state=TaskState.SUCCEEDED,
++            generation=notification.generation,
++        )
++        store.link_notification_obligation(
++            notification.notification_id, expected_state=TaskState.SUCCEEDED,
++            generation=notification.generation, obligation_id="ledger-1",
++        )
++
++    class NoopExecutor(FakeExecutor):
++        def __init__(self):
++            super().__init__(ExecutionResult(state=TaskState.SUCCEEDED))
++
++    with CodexTaskStore(path) as store:
++        bridge = CodexTaskBridge(
++            store, NoopExecutor(), on_settle=lambda _record, **_kw: calls.append("reinject") or True,
++            notification_renderer=lambda _record: "done",
++        )
++        try:
++            bridge.recover()
++            assert calls == []
++        finally:
++            bridge.close()
++
++
++def test_transport_failure_is_unknown_and_reconcile_is_read_only(tmp_path):
++    executor = FakeExecutor(
++        ExecutionResult(state=TaskState.UNKNOWN, codex_thread_id="thr-2", error_text="connection lost")
++    )
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        bridge = CodexTaskBridge(store, executor)
++        try:
++            record, _ = bridge.accept(make_request())
++            bridge.future(record.request.request_id).result(timeout=2)
++            assert store.get(record.request.request_id).state == TaskState.UNKNOWN
++            bridge.reconcile(record.request.request_id)
++            assert executor.inspected == [record.request.request_id]
++            assert executor.executed == [record.request.request_id]
++        finally:
++            bridge.close()
++
++
++def test_reconcile_can_settle_unknown_without_new_execution(tmp_path):
++    class ReconcileExecutor(FakeExecutor):
++        def __init__(self):
++            super().__init__(ExecutionResult(state=TaskState.UNKNOWN, codex_thread_id="thr-3"))
++
++        def inspect(self, task):
++            self.inspected.append(task.request.request_id)
++            return ExecutionResult(
++                state=TaskState.SUCCEEDED,
++                codex_thread_id="thr-3",
++                codex_turn_id="turn-3",
++                result_text="recovered",
++            )
++
++    executor = ReconcileExecutor()
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        bridge = CodexTaskBridge(store, executor)
++        try:
++            record, _ = bridge.accept(make_request())
++            bridge.future(record.request.request_id).result(timeout=2)
++            assert store.get(record.request.request_id).state == TaskState.UNKNOWN
++            settled = bridge.reconcile(record.request.request_id)
++            assert settled.state == TaskState.SUCCEEDED
++            assert settled.result_text == "recovered"
++            assert settled.error_text is None
++            assert executor.executed == [record.request.request_id]
++            assert executor.inspected == [record.request.request_id]
++        finally:
++            bridge.close()
++
++
++def test_recovery_rechecks_running_thread_without_resubmitting(tmp_path):
++    class EventuallyDone(FakeExecutor):
++        def __init__(self):
++            super().__init__(ExecutionResult(state=TaskState.RUNNING, codex_thread_id="thr-live"))
++            self.reads = 0
++
++        def inspect(self, task):
++            self.inspected.append(task.request.request_id)
++            self.reads += 1
++            if self.reads < 3:
++                return ExecutionResult(state=TaskState.RUNNING, codex_thread_id="thr-live")
++            return ExecutionResult(
++                state=TaskState.SUCCEEDED, codex_thread_id="thr-live", codex_turn_id="turn-live",
++                result_text="recovered",
++            )
++
++    path = tmp_path / "tasks.sqlite"
++    with CodexTaskStore(path) as store:
++        request = make_request()
++        store.register(request)
++        store.transition(request.request_id, TaskState.RUNNING, codex_thread_id="thr-live")
++    executor = EventuallyDone()
++    with CodexTaskStore(path) as store:
++        bridge = CodexTaskBridge(store, executor, reconcile_delay=0.001)
++        try:
++            bridge.recover()
++            bridge.future(request.request_id).result(timeout=2)
++            assert store.get(request.request_id).state == TaskState.SUCCEEDED
++            assert executor.executed == []
++            assert len(executor.inspected) == 3
++        finally:
++            bridge.close()
++
++
++def test_store_uses_private_sqlite_file(tmp_path):
++    path = tmp_path / "tasks.sqlite"
++    with CodexTaskStore(path) as store:
++        store.register(make_request())
++    assert sqlite3.connect(path).execute("SELECT COUNT(*) FROM codex_app_tasks").fetchone()[0] == 1
++    assert path.stat().st_mode & 0o777 == 0o600

@@ -1,0 +1,43 @@
+manifest_version: 2
+name: codex_tasks
+version: 0.1.0
+description: "Owner-DM-only durable Hermes to Codex app-server tasks"
+author: "Hermes–Codex bridge contributors"
+kind: standalone
+platforms:
+  - macos
+license: MIT
+provides_tools:
+  - codex_task_submit
+config_schema:
+  profile:
+    type: str
+    required: true
+    description: "Hermes profile name that serves the owner DM."
+  owner_conversation_id:
+    type: str
+    required: true
+    description: "Discord DM conversation identifier authorized for this bridge."
+  cwd:
+    type: str
+    required: true
+    description: "Codex app-server working directory."
+  state_path:
+    type: str
+    default: gateway/codex_app_tasks.sqlite
+    description: "Profile-relative private task-store path, or an absolute path."
+  codex_bin:
+    type: str
+    default: codex
+    description: "Codex executable or absolute path."
+  codex_home:
+    type: str
+    description: "Optional Codex home passed to the app-server."
+  turn_timeout:
+    type: float
+    default: 600
+    description: "Maximum seconds allowed for one Codex turn."
+  max_workers:
+    type: int
+    default: 1
+    description: "Maximum concurrent durable Codex tasks for this profile."
