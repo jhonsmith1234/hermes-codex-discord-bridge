@@ -68,5 +68,5 @@ reversible procedure.
 - Google Docs creation/editing and arbitrary third-party deployments are not
   covered by this package's verification.
 
-This repository is kept private pending review. Do not change its visibility
-to public without an explicit review decision.
+This repository is public. Keep Discord, Codex, and MCP credentials in their
+normal local secret stores; never commit them to this repository.
