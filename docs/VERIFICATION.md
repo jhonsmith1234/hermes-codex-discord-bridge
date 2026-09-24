@@ -20,7 +20,7 @@ scripts/run_tests.sh tests/agent/transports/test_codex_app_server_session.py \
 64 passed, 0 failed
 ```
 
-The packaging-only contract tests completed with `3 passed`. The installed
+The packaging-only contract tests completed with `4 passed`. The installed
 plugin also passed Hermes' isolated `hermes plugins validate --json` probe and
 compiled with `py_compile`. A configured registration smoke test confirmed the
 tool, command, injector-ready callback, and unload cleanup registrations
