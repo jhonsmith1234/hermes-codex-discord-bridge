@@ -45,6 +45,12 @@ Set `allow_gateway_injection: true` only for this reviewed plugin entry. The
 plugin uses this explicit host permission to send a completion or waiting
 notice back into the existing gateway session.
 
+If the gateway's Discord slash-access policy defines
+`gateway.platforms.discord.extra.user_allowed_commands`, add both
+`codex-respond` and `codex-recover` to that list. Otherwise the built-in
+admin-only gate will reject the recovery command before the plugin receives
+it, even when the request comes from the configured owner DM.
+
 The Discord bot token, Codex authentication, and any MCP credentials remain in
 the target installation's normal secret stores. They are not part of this
 configuration example.
@@ -94,6 +100,23 @@ The notification includes the request and server-request identifiers. The
 answer is validated against the live request and resumes the same Codex turn;
 guessing an ID or answering from another DM is rejected.
 
+If a gateway restart loses the live app-server session, the task is marked
+`unknown` and is never replayed automatically. Use the owner-DM recovery
+command after reviewing the original request:
+
+```text
+/codex-recover status <task_id>
+/codex-recover inspect <task_id>
+/codex-recover retry <task_id> RETRY
+/codex-recover cancel <task_id> CANCEL
+```
+
+`inspect` only reads the persisted Codex thread and may settle a terminal task;
+it never starts a new turn. `retry` is an explicit new Codex turn and may
+duplicate effects from the unknown run. `cancel` records a local cancellation
+and does not claim that an already-lost external process was cancelled.
+These commands are accepted only in the configured owner DM and profile.
+
 ## Removal and rollback
 
 1. Stop the target gateway through its normal operator procedure.
@@ -107,5 +130,5 @@ guessing an ID or answering from another DM is rejected.
    worktree containing unrelated operator changes.
 
 Pending tasks lost with a gateway restart are intentionally not auto-replayed;
-check their recorded state before deciding whether to retry the underlying
-work manually.
+use the owner-DM recovery commands above to inspect the recorded state before
+deciding whether to retry the underlying work manually.

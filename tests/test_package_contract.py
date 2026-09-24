@@ -29,6 +29,11 @@ def test_plugin_has_no_deployment_specific_absolute_paths_or_ids():
         assert re.search(r"\b\d{17,20}\b", text) is None
 
 
+def test_plugin_exposes_owner_recovery_command():
+    plugin_text = (PLUGIN / "__init__.py").read_text(encoding="utf-8")
+    assert "codex-recover" in plugin_text
+
+
 def test_config_example_is_placeholder_only():
     text = (ROOT / "examples" / "ownerreview-config.yaml").read_text(encoding="utf-8")
     assert "DISCORD_OWNER_DM_ID" in text

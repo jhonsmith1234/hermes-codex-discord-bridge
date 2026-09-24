@@ -60,6 +60,9 @@ reversible procedure.
   treated as delivery.
 - A pending live request lost during gateway restart is marked unknown and is
   not automatically replayed.
+- Unknown tasks can be inspected read-only, explicitly retried, or cancelled
+  from the authenticated owner DM with `/codex-recover`; retry requires the
+  literal `RETRY` confirmation because duplicate external effects are possible.
 - Long or interrupted multi-message sends remain at-least-once; exactly-once
   delivery is not promised.
 - Google Docs creation/editing and arbitrary third-party deployments are not

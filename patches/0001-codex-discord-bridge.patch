@@ -1432,10 +1432,10 @@ index 7548e59..8828e71 100644
 -
 diff --git a/gateway/codex_app_tasks.py b/gateway/codex_app_tasks.py
 new file mode 100644
-index 0000000..67e00cd
+index 0000000..17e2a41
 --- /dev/null
 +++ b/gateway/codex_app_tasks.py
-@@ -0,0 +1,1657 @@
+@@ -0,0 +1,1871 @@
 +"""Hermes -> Codex app-server task adapter.
 +
 +This module keeps Discord and gateway routing outside the Codex executor while
@@ -1498,7 +1498,7 @@ index 0000000..67e00cd
 +        TaskState.FAILED, TaskState.CANCELLED, TaskState.UNKNOWN,
 +    }),
 +    TaskState.UNKNOWN: frozenset({
-+        TaskState.UNKNOWN, TaskState.RUNNING, TaskState.WAITING_FOR_USER,
++        TaskState.UNKNOWN, TaskState.QUEUED, TaskState.RUNNING, TaskState.WAITING_FOR_USER,
 +        TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED,
 +    }),
 +    TaskState.SUCCEEDED: frozenset({TaskState.SUCCEEDED}),
@@ -1730,6 +1730,16 @@ index 0000000..67e00cd
 +    accepted: bool
 +    status: str
 +    message: str
++
++
++@dataclass(frozen=True, slots=True)
++class TaskRecoveryResult:
++    """Result returned by an authenticated manual recovery command."""
++
++    accepted: bool
++    status: str
++    message: str
++    record: TaskRecord | None = None
 +
 +
 +_UNSET = object()
@@ -2033,6 +2043,21 @@ index 0000000..67e00cd
 +                "ORDER BY updated_at ASC"
 +            ).fetchall()
 +        return [self._notification(row) for row in rows]
++
++    def supersede_unresolved_notifications(self, task_id: str, *, expected_state: TaskState,
++                                           reason: str) -> int:
++        """Retire unlinked notices before an explicit retry creates a new version."""
++        with self._lock:
++            cursor = self._conn.execute(
++                """UPDATE codex_task_notifications SET status='superseded', error_text=?, updated_at=?
++                   WHERE task_id=? AND expected_state=?
++                     AND status NOT IN ('delivered', 'superseded')
++                     AND delivery_obligation_id IS NULL""",
++                (str(reason or "Superseded by an explicit retry")[:1000], time.time(),
++                 str(task_id), TaskState(expected_state).value),
++            )
++            self._conn.commit()
++            return int(cursor.rowcount)
 +
 +    def mark_notification_attempt(self, notification_id: str, *, force: bool = False) -> TaskNotification:
 +        with self._lock:
@@ -2588,6 +2613,190 @@ index 0000000..67e00cd
 +            return record
 +        return self._settle(request_id, outcome)
 +
++    def manual_recover(
++        self, task_id: str, action: str, *, origin: DiscordOrigin,
++        confirmation: str | None = None,
++    ) -> TaskRecoveryResult:
++        """Inspect, explicitly retry, or cancel one owner-owned unknown task.
++
++        Inspection is read-only and never creates a new Codex turn.  Retrying
++        and cancelling require separate literal confirmations because an
++        ``unknown`` task may have completed externally before its final state
++        reached Hermes.
++        """
++        try:
++            record = self.store.get(task_id)
++        except KeyError:
++            return TaskRecoveryResult(False, "not_found", "No Codex task exists for that task id")
++        if not _same_origin(record.request.origin, origin):
++            return TaskRecoveryResult(False, "forbidden", "That Codex task is not owned by this Discord DM")
++
++        normalized_action = str(action or "").strip().lower()
++        if normalized_action in {"status", "show"}:
++            return TaskRecoveryResult(True, "status", "No recovery action was taken", record)
++
++        if normalized_action in {"inspect", "reconcile"}:
++            if record.state != TaskState.UNKNOWN:
++                return TaskRecoveryResult(
++                    False, "stale",
++                    f"Manual inspection is only needed for unknown tasks; this task is {record.state.value}",
++                    record,
++                )
++            if self._has_active_future(task_id):
++                return TaskRecoveryResult(
++                    False, "busy", "A recovery check is already running for this task; try again shortly", record,
++                )
++            if not record.codex_thread_id:
++                unchanged = self.store.transition(
++                    task_id, TaskState.UNKNOWN,
++                    error_text=(
++                        "Read-only inspection could not start because no Codex thread id was persisted. "
++                        "Choose an explicit retry or cancel action after reviewing the original request."
++                    ),
++                )
++                return TaskRecoveryResult(
++                    True, "inconclusive", unchanged.error_text or "Inspection was inconclusive", unchanged,
++                )
++            try:
++                outcome = self._inspect_until_settled(record)
++            except Exception as exc:
++                logger.exception("manual Codex task inspection failed")
++                outcome = ExecutionResult(
++                    state=TaskState.UNKNOWN, codex_thread_id=record.codex_thread_id,
++                    error_text=f"Read-only inspection failed: {type(exc).__name__}",
++                )
++            if outcome is not None and outcome.state in TERMINAL_STATES:
++                settled = self._settle(task_id, outcome)
++                return TaskRecoveryResult(
++                    True, "reconciled",
++                    f"Read-only inspection settled the task as {settled.state.value}", settled,
++                )
++            if outcome is None:
++                message = (
++                    "Read-only inspection returned no Codex state. No new turn was started; "
++                    "choose an explicit retry or cancel action after reviewing the original request."
++                )
++                thread_id = None
++                turn_id = None
++            elif outcome.state == TaskState.RUNNING:
++                message = (
++                    "Read-only inspection still sees the Codex turn as running. No new turn was started, "
++                    "and the live approval session cannot be recreated here; choose retry or cancel only "
++                    "after reviewing the possible duplicate effect."
++                )
++                thread_id = outcome.codex_thread_id
++                turn_id = outcome.codex_turn_id
++            elif outcome.state == TaskState.WAITING_FOR_USER:
++                message = (
++                    "Read-only inspection found a Codex request waiting for input, but the live app-server "
++                    "session is not attached to this gateway. The old request cannot be answered; choose "
++                    "retry or cancel explicitly."
++                )
++                thread_id = outcome.codex_thread_id
++                turn_id = outcome.codex_turn_id
++            else:
++                message = (
++                    outcome.error_text
++                    or "Read-only inspection could not determine a terminal Codex state. "
++                    "No new turn was started; choose retry or cancel explicitly."
++                )
++                thread_id = outcome.codex_thread_id
++                turn_id = outcome.codex_turn_id
++            unchanged = self.store.transition(
++                task_id, TaskState.UNKNOWN,
++                codex_thread_id=thread_id if thread_id is not None else _UNSET,
++                codex_turn_id=turn_id if turn_id is not None else _UNSET,
++                error_text=message,
++            )
++            return TaskRecoveryResult(True, "inconclusive", message, unchanged)
++
++        if normalized_action in {"retry", "replay"}:
++            if str(confirmation or "").strip().upper() != "RETRY":
++                return TaskRecoveryResult(
++                    False, "confirmation_required",
++                    "Explicit confirmation required: append the literal RETRY to acknowledge possible duplicate effects",
++                    record,
++                )
++            if record.state != TaskState.UNKNOWN:
++                return TaskRecoveryResult(
++                    False, "stale", f"Only unknown tasks can be retried; this task is {record.state.value}", record,
++                )
++            if self._has_active_future(task_id):
++                return TaskRecoveryResult(
++                    False, "busy", "A recovery check is already running for this task; try again shortly", record,
++                )
++            retry_note = (
++                "Owner explicitly requested a retry after manual review. The previous Codex run may have "
++                "completed before its final state was recorded; duplicate external effects are possible."
++            )
++            try:
++                queued = self.store.transition(
++                    task_id, TaskState.QUEUED,
++                    codex_thread_id=None, codex_turn_id=None, result_text=None, error_text=retry_note,
++                    pending_server_request_id=None, pending_server_request_method=None,
++                    pending_server_request_summary=None, pending_server_request_expires_at=None,
++                )
++            except InvalidStateTransition:
++                current = self.store.get(task_id)
++                return TaskRecoveryResult(
++                    False, "stale", f"The task changed state before retry; it is now {current.state.value}", current,
++                )
++            self.store.supersede_unresolved_notifications(
++                task_id, expected_state=TaskState.UNKNOWN,
++                reason="Superseded by the owner's explicit retry command",
++            )
++            try:
++                self._schedule(task_id, self._run)
++            except Exception as exc:
++                logger.exception("could not schedule manually retried Codex task %s", task_id)
++                failed = self.store.transition(
++                    task_id, TaskState.UNKNOWN,
++                    error_text=f"Explicit retry could not be queued: {type(exc).__name__}",
++                )
++                self._notify_settlement(failed)
++                return TaskRecoveryResult(False, "schedule_failed", failed.error_text or "Retry failed", failed)
++            return TaskRecoveryResult(
++                True, "queued",
++                "Explicit retry accepted. A new Codex turn may duplicate effects from the unknown run; "
++                "wait for the completion notice.", queued,
++            )
++
++        if normalized_action in {"cancel", "abandon"}:
++            if str(confirmation or "").strip().upper() != "CANCEL":
++                return TaskRecoveryResult(
++                    False, "confirmation_required",
++                    "Explicit confirmation required: append the literal CANCEL to abandon the unknown task",
++                    record,
++                )
++            if record.state != TaskState.UNKNOWN:
++                return TaskRecoveryResult(
++                    False, "stale", f"Only unknown tasks can be cancelled; this task is {record.state.value}", record,
++                )
++            if self._has_active_future(task_id):
++                return TaskRecoveryResult(
++                    False, "busy", "A recovery check is already running for this task; try again shortly", record,
++                )
++            try:
++                cancelled = self.store.transition(
++                    task_id, TaskState.CANCELLED,
++                    error_text="Cancelled by the owner through manual recovery",
++                    pending_server_request_id=None, pending_server_request_method=None,
++                    pending_server_request_summary=None, pending_server_request_expires_at=None,
++                )
++            except InvalidStateTransition:
++                current = self.store.get(task_id)
++                return TaskRecoveryResult(
++                    False, "stale", f"The task changed state before cancellation; it is now {current.state.value}", current,
++                )
++            self._notify_settlement(cancelled)
++            return TaskRecoveryResult(True, "cancelled", "The unknown task was cancelled locally", cancelled)
++
++        return TaskRecoveryResult(
++            False, "invalid_action",
++            "Unknown recovery action; use status, inspect, retry, or cancel",
++            record,
++        )
++
 +    def close(self, *, wait: bool = True) -> None:
 +        close_executor = getattr(self.executor, "close", None)
 +        if callable(close_executor):
@@ -2660,6 +2869,11 @@ index 0000000..67e00cd
 +            if current is not None and not current.done():
 +                return
 +            self._futures[request_id] = self._pool.submit(worker, request_id)
++
++    def _has_active_future(self, request_id: str) -> bool:
++        with self._lock:
++            future = self._futures.get(request_id)
++            return future is not None and not future.done()
 +
 +    def _settle(self, request_id: str, outcome: ExecutionResult) -> TaskRecord:
 +        clear_error = outcome.state in {TaskState.SUCCEEDED, TaskState.CANCELLED}
@@ -3095,10 +3309,10 @@ index 0000000..67e00cd
 +    return True, result.message
 diff --git a/tests/gateway/test_codex_app_tasks.py b/tests/gateway/test_codex_app_tasks.py
 new file mode 100644
-index 0000000..62619a5
+index 0000000..b4ab1a1
 --- /dev/null
 +++ b/tests/gateway/test_codex_app_tasks.py
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,730 @@
 +from __future__ import annotations
 +
 +import sqlite3
@@ -3709,6 +3923,116 @@ index 0000000..62619a5
 +            assert store.get(request.request_id).state == TaskState.SUCCEEDED
 +            assert executor.executed == []
 +            assert len(executor.inspected) == 3
++        finally:
++            bridge.close()
++
++
++def test_manual_recovery_inspect_is_read_only_and_does_not_resubmit(tmp_path):
++    executor = FakeExecutor(
++        ExecutionResult(state=TaskState.UNKNOWN, codex_thread_id="thr-unknown", error_text="still unknown")
++    )
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        bridge = CodexTaskBridge(store, executor, reconcile_delay=0.001)
++        try:
++            record, _ = bridge.accept(make_request(message_id="manual-inspect"))
++            bridge.future(record.request.request_id).result(timeout=2)
++            result = bridge.manual_recover(
++                record.request.request_id, "inspect", origin=record.request.origin,
++            )
++            assert result.accepted is True
++            assert result.status == "inconclusive"
++            assert store.get(record.request.request_id).state == TaskState.UNKNOWN
++            assert executor.executed == [record.request.request_id]
++            assert executor.inspected == [record.request.request_id]
++        finally:
++            bridge.close()
++
++
++def test_manual_recovery_retry_requires_explicit_confirmation_and_starts_one_new_turn(tmp_path):
++    class RetryExecutor:
++        def __init__(self):
++            self.executed: list[str] = []
++            self.outcomes = [
++                ExecutionResult(state=TaskState.UNKNOWN, codex_thread_id="thr-old", error_text="lost"),
++                ExecutionResult(state=TaskState.SUCCEEDED, codex_thread_id="thr-new", result_text="retried"),
++            ]
++
++        def execute(self, task, *, on_thread_started=None, on_turn_started=None):
++            self.executed.append(task.request.request_id)
++            outcome = self.outcomes[len(self.executed) - 1]
++            if on_thread_started:
++                on_thread_started(outcome.codex_thread_id or "thread-fake")
++            return outcome
++
++        def inspect(self, task):
++            return None
++
++    executor = RetryExecutor()
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        bridge = CodexTaskBridge(store, executor)
++        try:
++            record, _ = bridge.accept(make_request(message_id="manual-retry"))
++            bridge.future(record.request.request_id).result(timeout=2)
++            rejected = bridge.manual_recover(
++                record.request.request_id, "retry", origin=record.request.origin,
++            )
++            assert rejected.accepted is False
++            assert rejected.status == "confirmation_required"
++            assert executor.executed == [record.request.request_id]
++
++            queued = bridge.manual_recover(
++                record.request.request_id, "retry", origin=record.request.origin, confirmation="RETRY",
++            )
++            assert queued.accepted is True
++            assert queued.status == "queued"
++            bridge.future(record.request.request_id).result(timeout=2)
++            retried = store.get(record.request.request_id)
++            assert retried.state == TaskState.SUCCEEDED
++            assert retried.result_text == "retried"
++            assert executor.executed == [record.request.request_id, record.request.request_id]
++        finally:
++            bridge.close()
++
++
++def test_manual_recovery_cancel_is_owner_bound_and_requires_confirmation(tmp_path):
++    executor = FakeExecutor(ExecutionResult(state=TaskState.UNKNOWN, codex_thread_id="thr-cancel"))
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        bridge = CodexTaskBridge(store, executor)
++        try:
++            record, _ = bridge.accept(make_request(message_id="manual-cancel"))
++            bridge.future(record.request.request_id).result(timeout=2)
++            wrong_origin = DiscordOrigin("other", record.request.origin.conversation_id, "m-other")
++            forbidden = bridge.manual_recover(
++                record.request.request_id, "cancel", origin=wrong_origin, confirmation="CANCEL",
++            )
++            assert forbidden.accepted is False
++            assert forbidden.status == "forbidden"
++            missing_confirmation = bridge.manual_recover(
++                record.request.request_id, "cancel", origin=record.request.origin,
++            )
++            assert missing_confirmation.status == "confirmation_required"
++            cancelled = bridge.manual_recover(
++                record.request.request_id, "cancel", origin=record.request.origin, confirmation="CANCEL",
++            )
++            assert cancelled.accepted is True
++            assert cancelled.status == "cancelled"
++            assert store.get(record.request.request_id).state == TaskState.CANCELLED
++        finally:
++            bridge.close()
++
++
++def test_manual_recovery_without_persisted_thread_id_does_not_inspect(tmp_path):
++    executor = FakeExecutor(ExecutionResult(state=TaskState.SUCCEEDED, result_text="should not run"))
++    with CodexTaskStore(tmp_path / "tasks.sqlite") as store:
++        request = make_request(message_id="manual-no-thread")
++        store.register(request)
++        store.transition(request.request_id, TaskState.UNKNOWN, error_text="interrupted")
++        bridge = CodexTaskBridge(store, executor)
++        try:
++            result = bridge.manual_recover(request.request_id, "inspect", origin=request.origin)
++            assert result.status == "inconclusive"
++            assert executor.inspected == []
++            assert executor.executed == []
 +        finally:
 +            bridge.close()
 +
